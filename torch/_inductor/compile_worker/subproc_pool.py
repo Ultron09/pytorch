@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 import pickle
+import signal
 import struct
 import subprocess
 import sys
@@ -286,7 +287,13 @@ class SubprocPool:
         if args or kwargs:
             # pyrefly: ignore [bad-assignment]
             job_fn = functools.partial(job_fn, *args, **kwargs)
-        job_data = self.pickler.dumps(job_fn)
+        job_data = self.pickler.dumps(
+            (
+                job_fn,
+                config.compile_worker_memory_limit_kb,
+                config.compile_worker_per_kernel_timeout,
+            )
+        )
         future: Future[_T]
         with self.futures_lock:
             job_id = next(self.job_id_count)
@@ -465,6 +472,20 @@ class SubprocPool:
             status = self.pickler.loads(data)
             if not isinstance(status, dict):
                 return
+            if "enforcement" in status:
+                enforcement = status["enforcement"]
+                trace_structured(
+                    "artifact",
+                    metadata_fn=lambda: {
+                        "name": "compile_worker_memory_enforcement",
+                        "encoding": "string",
+                    },
+                    payload_fn=lambda: enforcement,
+                    expect_trace_id=False,
+                    suppress_context=True,
+                    record_logging_overhead=False,
+                )
+                return
             compile_id = self._job_compile_id.get(job_id)
             record = {**status, "compile_id": str(compile_id) if compile_id else None}
             trace_structured(
@@ -550,11 +571,18 @@ class SubprocMain:
         self.nprocs = nprocs
         self.pool: ProcessPoolExecutor | None = None
         self.pool_finalizer: Any | None = None
+        self._pool_lock = threading.Lock()
         self.running = True
         # job_id -> monotonic submit time; scanned by the watchdog thread.
         self._inflight: dict[int, float] = {}
         self._inflight_lock = threading.Lock()
         self._watchdog_stop = threading.Event()
+        self._draining = False
+        self._drain_deadline: float = float("inf")
+        # job_id -> worker_pid for all limit-breaching workers during a drain.
+        self._offenders: dict[int, int] = {}
+        self._offender_reasons: dict[int, str] = {}
+        self._draining_jobs: dict[int, bytes] = {}
 
     def main(self) -> None:
         # Phase heartbeats rely on fork inheritance of the shared buffer; spawn
@@ -589,20 +617,19 @@ class SubprocMain:
         self._shutdown_pool(terminate_workers=True)
 
     def _shutdown_pool(self, *, terminate_workers: bool) -> None:
-        if self.pool is None:
-            return
+        with self._pool_lock:
+            if self.pool is None:
+                return
 
-        pool = self.pool
-        self.pool = None
+            pool = self.pool
+            self.pool = None
 
-        if self.pool_finalizer is not None:
-            if terminate_workers:
-                self.pool_finalizer.cancel()
-            self.pool_finalizer = None
+            if self.pool_finalizer is not None:
+                if terminate_workers:
+                    self.pool_finalizer.cancel()
+                self.pool_finalizer = None
 
         if terminate_workers:
-            # The sidecar is exiting, so do not let ProcessPoolExecutor's
-            # interpreter finalization wait for running compiler workers.
             _terminate_process_pool(pool)
         else:
             pool.shutdown(wait=False)
@@ -612,6 +639,9 @@ class SubprocMain:
         # reported elapsed intentionally includes cold pool creation and the fork
         # of the workers -- that wait is real and worth surfacing.
         with self._inflight_lock:
+            if self._draining:
+                self._draining_jobs[job_id] = data
+                return
             self._inflight[job_id] = time.monotonic()
         while self.running:
             try:
@@ -629,12 +659,30 @@ class SubprocMain:
                     job_id,
                     exc_info=True,
                 )
-                self.pool = None
+                with self._pool_lock:
+                    self.pool = None
 
     def _submit_inner(self, job_id: int, data: bytes) -> None:
         def callback(fut: Future[Any]) -> None:
+            offender_reason: str | None = None
             with self._inflight_lock:
                 self._inflight.pop(job_id, None)
+                # Offender whose limit was breached: pop the descriptive
+                # reason under lock, send outside.  Check _offender_reasons
+                # (not _offenders) because _offenders may already be cleared
+                # by _end_draining's lock section by the time this fires.
+                offender_reason = self._offender_reasons.pop(job_id, None)
+                if offender_reason is None and self._draining:
+                    if fut.cancelled() or fut.exception() is not None:
+                        self._draining_jobs[job_id] = data
+                        return
+            if offender_reason is not None:
+                exc = RuntimeError(offender_reason)
+                result = self.pickler.dumps(exc)
+                with self.write_lock:
+                    if self.running:
+                        _send_msg(self.write_pipe, MsgHeader.JOB, job_id, result)
+                return
             if not self.running:
                 return
             try:
@@ -659,35 +707,79 @@ class SubprocMain:
         future.add_done_callback(callback)
 
     def _start_pool(self) -> None:
-        if self.pool is not None:
+        with self._pool_lock:
+            if self.pool is not None:
+                return
+
+            # Recycle heartbeat slots before the new worker generation forks.
+            watchdog.reset()
+
+            # Only fork workers inherit the sidecar<->parent pipe fds and must close
+            # them (see _async_compile_initializer). Under spawn the workers do not
+            # inherit them (close_fds=True + O_CLOEXEC), and these integers would
+            # refer to unrelated fds the fresh interpreter reused -- closing them
+            # would be silent corruption, not a no-op.
+            close_fds = (
+                (self.read_pipe.fileno(), self.write_pipe.fileno())
+                if self.kind == SubprocKind.FORK
+                else ()
+            )
+            self.pool = TrackedProcessPoolExecutor(
+                self.nprocs,
+                mp_context=multiprocessing.get_context(self.kind.value),
+                initializer=functools.partial(
+                    _async_compile_initializer, os.getpid(), close_fds
+                ),
+            )
+            self.pool_finalizer = multiprocessing.util.Finalize(
+                None, self.pool.shutdown, exitpriority=sys.maxsize
+            )
+            _warm_process_pool(self.pool, self.nprocs)
+
+    def _begin_draining(self, worker_pid: int, job_id: int) -> None:
+        self._offenders[job_id] = worker_pid
+        try:
+            os.killpg(worker_pid, signal.SIGSTOP)
+        except (ProcessLookupError, PermissionError):
+            pass
+        if not self._draining:
+            self._drain_deadline = (
+                time.monotonic() + config.compile_worker_watchdog_interval_seconds
+            )
+        self._draining = True
+
+    def _end_draining(self) -> None:
+        if not self._offenders:
             return
-
-        # Recycle heartbeat slots before the new worker generation forks.
-        watchdog.reset()
-
-        # Only fork workers inherit the sidecar<->parent pipe fds and must close
-        # them (see _async_compile_initializer). Under spawn the workers do not
-        # inherit them (close_fds=True + O_CLOEXEC), and these integers would
-        # refer to unrelated fds the fresh interpreter reused -- closing them
-        # would be silent corruption, not a no-op.
-        close_fds = (
-            (self.read_pipe.fileno(), self.write_pipe.fileno())
-            if self.kind == SubprocKind.FORK
-            else ()
-        )
-        self.pool = TrackedProcessPoolExecutor(
-            self.nprocs,
-            mp_context=multiprocessing.get_context(self.kind.value),
-            initializer=functools.partial(
-                _async_compile_initializer, os.getpid(), close_fds
-            ),
-        )
-        self.pool_finalizer = multiprocessing.util.Finalize(
-            None, self.pool.shutdown, exitpriority=sys.maxsize
-        )
-        _warm_process_pool(self.pool, self.nprocs)
+        for pid in self._offenders.values():
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        # Descriptive errors for offenders are sent by the callback (which
+        # pops from _offender_reasons), not here -- avoids a double-send race
+        # where the callback fires after _offenders.clear() and also sends.
+        self._shutdown_pool(terminate_workers=True)
+        with self._inflight_lock:
+            for job_id in self._offenders:
+                self._inflight.pop(job_id, None)
+            self._offenders.clear()
+            buffered = dict(self._draining_jobs)
+            self._draining_jobs.clear()
+            self._draining = False
+        for job_id, data in buffered.items():
+            self.submit(job_id, data)
 
     def _start_watchdog(self) -> None:
+        enforcement = config.compile_worker_memory_enforcement
+        status = {"enforcement": enforcement}
+        payload = self.pickler.dumps(status)
+        try:
+            with self.write_lock:
+                if self.running:
+                    _send_msg(self.write_pipe, MsgHeader.STATUS, -1, payload)
+        except (OSError, ValueError):
+            pass
         interval = config.compile_worker_watchdog_interval_seconds
         if interval <= 0:
             return
@@ -698,20 +790,96 @@ class SubprocMain:
             daemon=True,
         ).start()
 
+    def _check_memory_violation(self, worker_pid: int, memory_limit: int) -> bool:
+        if config.compile_worker_memory_enforcement == "off":
+            return False
+        return watchdog.is_worker_memory_limit_exceeded(worker_pid, memory_limit)
+
+    def _check_job_limits(
+        self,
+        job_id: int,
+        heartbeats: dict[int, tuple[int, int, int, int, int, int]],
+        now_ns: int,
+    ) -> tuple[int, str] | None:
+        """Returns (worker_pid, reason) if the job breached its limits, else None.
+
+        Pure check -- no state mutation, safe to call without _inflight_lock.
+        """
+        heartbeat = heartbeats.get(job_id)
+        if heartbeat is None:
+            return None
+        _, _, worker_pid, job_start_ns, memory_limit, timeout = heartbeat
+        elapsed_from_start = (now_ns - job_start_ns) / 1e9
+
+        if timeout > 0 and elapsed_from_start >= timeout:
+            return (
+                worker_pid,
+                f"Compile worker {worker_pid} killed: per-kernel timeout {timeout}s exceeded (elapsed {elapsed_from_start:.1f}s) on job {job_id}",
+            )
+
+        if memory_limit > 0 and self._check_memory_violation(worker_pid, memory_limit):
+            return (
+                worker_pid,
+                f"Compile worker {worker_pid} killed: memory limit {memory_limit} kB exceeded on job {job_id}",
+            )
+
+        return None
+
     def _watchdog_loop(self, interval: float) -> None:
         # Every `interval` seconds, report any job still running past `interval`
         # so a stuck/slow worker leaves a breadcrumb (the parent turns these into
         # tlparse artifacts). Re-reports each tick with a growing elapsed time.
+        # When per-kernel timeout / total memory limits are crossed, stop the offending worker
+        # quiesce the pool and then kill the offending worker. BrokenProcessPool recreates the pool.
+
         while not self._watchdog_stop.wait(interval):
             now = time.monotonic()
             now_ns = time.monotonic_ns()
+
             heartbeats = watchdog.read_heartbeats()
+            slow: list[tuple[int, float]] = []
+            drain_ready = False
+            check_jobs: list[int] = []
+
+            # Snapshot under lock (cheap)
             with self._inflight_lock:
-                slow = [
-                    (job_id, elapsed)
-                    for job_id, start in self._inflight.items()
-                    if (elapsed := now - start) >= interval
-                ]
+                if self._draining:
+                    check_jobs = [
+                        j
+                        for j in self._inflight
+                        if j not in self._offenders and heartbeats.get(j) is not None
+                    ]
+                    drain_ready = now >= self._drain_deadline or all(
+                        j in self._offenders or heartbeats.get(j) is None
+                        for j in self._inflight
+                    )
+                else:
+                    check_jobs = list(self._inflight.keys())
+                    for job_id, start in self._inflight.items():
+                        elapsed = now - start
+                        if elapsed >= interval:
+                            slow.append((job_id, elapsed))
+
+            # Expensive limit checks outside lock (/proc reads)
+            breaches: list[tuple[int, int, str]] = []
+            for job_id in check_jobs:
+                breach = self._check_job_limits(job_id, heartbeats, now_ns)
+                if breach is not None:
+                    breaches.append((job_id, breach[0], breach[1]))
+
+            if breaches:
+                with self._inflight_lock:
+                    for job_id, worker_pid, reason in breaches:
+                        if job_id not in self._inflight:
+                            continue
+                        log.warning("%s; draining siblings before kill", reason)
+                        self._offender_reasons[job_id] = reason
+                        self._begin_draining(worker_pid, job_id)
+
+            if drain_ready:
+                self._end_draining()
+                continue
+
             for job_id, elapsed in slow:
                 self._report_status(job_id, elapsed, heartbeats.get(job_id), now_ns)
 
@@ -719,12 +887,12 @@ class SubprocMain:
         self,
         job_id: int,
         elapsed: float,
-        heartbeat: tuple[int, int, int] | None,
+        heartbeat: tuple[int, int, int, int, int, int] | None,
         now_ns: int,
     ) -> None:
         status: dict[str, Any] = {"job_id": job_id, "elapsed_s": round(elapsed, 1)}
         if heartbeat is not None:
-            phase, phase_start_ns, worker_pid = heartbeat
+            phase, phase_start_ns, worker_pid, job_start_ns, _, _ = heartbeat
             status["phase"] = watchdog.Phase(phase).name.lower()
             status["phase_elapsed_s"] = round((now_ns - phase_start_ns) / 1e9, 1)
             status["worker_pid"] = worker_pid
@@ -751,11 +919,14 @@ class SubprocMain:
     @staticmethod
     def do_job(pickler: SubprocPickler, job_id: int, data: bytes) -> bytes:
         # do the pickle/unpickle in the sub-subproc
-        watchdog.set_current_job(job_id)
+        (job_fn, memory_limit, timeout) = typing.cast(
+            tuple[Callable[[], object], int, int],
+            pickler.loads(data),
+        )
+        watchdog.set_current_job(job_id, memory_limit, timeout)
         try:
-            job = typing.cast(Callable[[], object], pickler.loads(data))
             try:
-                result = job()
+                result = job_fn()
             except Exception:
                 result = _SubprocExceptionInfo(traceback.format_exc())
             return pickler.dumps(result)
