@@ -4371,6 +4371,10 @@ class TestUnbacked(TestCase):
 
 class TestUbackedOps(TestCase):
     @fresh_cache()
+    @unittest.skipIf(
+        torch._dynamo.config.use_cpp_fake_tensor,
+        "C++ FakeTensor has different FX node names",
+    )
     @skipIfTorchDynamo("not allowed to trace mark_unbacked")
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_reshape1(self):
@@ -4992,6 +4996,10 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
     @skipIfTorchDynamo("not allowed to trace mark_unbacked")
     @fresh_cache()
+    @unittest.skipIf(
+        torch._dynamo.config.use_cpp_fake_tensor,
+        "C++ FakeTensor has different FX node names",
+    )
     def test_unbacked_contiguous(self):
         cnt = CompileCounterWithBackend("inductor")
 
