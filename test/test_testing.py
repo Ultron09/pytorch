@@ -23,7 +23,7 @@ from torch.testing import make_tensor
 from torch.testing._internal.common_utils import (
     IS_FBCODE, IS_JETSON, IS_MACOS, IS_SANDCASTLE, IS_WINDOWS, TestCase, run_tests, slowTest,
     parametrize, reparametrize, subtest, instantiate_parametrized_tests, dtype_name,
-    TEST_WITH_ROCM, decorateIf, skipIfXpu
+    TEST_WITH_PERIODIC, TEST_WITH_ROCM, check_if_enable, decorateIf, periodic, skipIfXpu, suppress_warnings,
 )
 from torch.testing._internal.common_device_type import \
     (PYTORCH_TESTING_DEVICE_EXCEPT_FOR_KEY, PYTORCH_TESTING_DEVICE_ONLY_FOR_KEY, dtypes,
@@ -610,6 +610,189 @@ if __name__ == '__main__':
         env[PYTORCH_TESTING_DEVICE_ONLY_FOR_KEY] = 'cpu'
         _, stderr = TestCase.run_process_no_exception(test_filter_file_template, env=env)
         self.assertNotIn('OK', stderr.decode('ascii'))
+
+
+class TestPeriodicDecorator(TestCase):
+    @staticmethod
+    def _patch_test_env(**overrides):
+        """Patches the common_utils globals consulted by @periodic, slowTest,
+        and check_if_enable so inner test classes are hermetic to the outer
+        test run's environment."""
+        defaults = dict(
+            TEST_WITH_PERIODIC=False,
+            TEST_WITH_SLOW=False,
+            TEST_SKIP_FAST=False,
+            IS_SANDCASTLE=False,
+            RERUN_DISABLED_TESTS=False,
+            slow_tests_dict={},
+            disabled_tests_dict={},
+        )
+        defaults.update(overrides)
+        return unittest.mock.patch.multiple("torch.testing._internal.common_utils", **defaults)
+
+    @parametrize("periodic_enabled", [False, True])
+    def test_periodic_gates_on_periodic_mode(self, periodic_enabled):
+        with self._patch_test_env(TEST_WITH_PERIODIC=periodic_enabled):
+            class TestP(TestCase):
+                @periodic
+                def test_p(self):
+                    pass
+
+        self.assertTrue(TestP.test_p.__dict__.get("periodic_test"))
+        self.assertEqual(getattr(TestP.test_p, "__unittest_skip__", False), not periodic_enabled)
+        if not periodic_enabled:
+            self.assertIn("PYTORCH_TEST_WITH_PERIODIC", TestP.test_p.__unittest_skip_why__)
+
+    def test_periodic_skip_happens_before_setup(self):
+        with self._patch_test_env():
+            class TestP(TestCase):
+                def setUp(self):
+                    self.fail("setUp ran for a disabled periodic test")
+
+                @periodic
+                def test_p(self):
+                    pass
+
+            result = unittest.TestResult()
+            TestP("test_p").run(result)
+        self.assertEqual(len(result.skipped), 1)
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.errors, [])
+
+    @parametrize("periodic_enabled", [False, True])
+    def test_periodic_composes_with_parametrize(self, periodic_enabled):
+        with self._patch_test_env(TEST_WITH_PERIODIC=periodic_enabled):
+            class TestP(TestCase):
+                @parametrize("x", [1])
+                @periodic
+                def test_under(self, x):
+                    pass
+
+                @periodic
+                @parametrize("x", [2])
+                def test_over(self, x):
+                    pass
+
+            instantiate_parametrized_tests(TestP)
+
+        for name in ("test_under_x_1", "test_over_x_2"):
+            test_fn = getattr(TestP, name)
+            self.assertTrue(test_fn.__dict__.get("periodic_test"), msg=name)
+            self.assertEqual(getattr(test_fn, "__unittest_skip__", False), not periodic_enabled, msg=name)
+
+    @parametrize("periodic_enabled", [False, True])
+    def test_subtest_decorator_isolation(self, periodic_enabled):
+        with self._patch_test_env(TEST_WITH_PERIODIC=periodic_enabled):
+            class TestP(TestCase):
+                @parametrize("x", [subtest(1, name="periodic_subtest", decorators=[periodic]), subtest(2, name="plain_subtest")])
+                def test_s(self, x):
+                    pass
+
+            instantiate_parametrized_tests(TestP)
+
+        periodic_fn, plain_fn = TestP.test_s_periodic_subtest, TestP.test_s_plain_subtest
+        self.assertTrue(periodic_fn.__dict__.get("periodic_test"))
+        self.assertEqual(getattr(periodic_fn, "__unittest_skip__", False), not periodic_enabled)
+        self.assertFalse(plain_fn.__dict__.get("periodic_test", False))
+        self.assertFalse(getattr(plain_fn, "__unittest_skip__", False))
+
+    def test_periodic_composes_with_device_type_instantiation(self):
+        with self._patch_test_env(TEST_WITH_PERIODIC=True):
+            class TestP(TestCase):
+                @periodic
+                def test_p(self, device):
+                    pass
+
+            scope = {"TestP": TestP}
+            instantiate_device_type_tests(TestP, scope, only_for="cpu")
+
+        test_fn = scope["TestPCPU"].test_p_cpu
+        self.assertTrue(test_fn.__dict__.get("periodic_test"))
+        self.assertFalse(getattr(test_fn, "__unittest_skip__", False))
+
+    def test_check_if_enable_dynamic_slow_respects_periodic(self):
+        with self._patch_test_env(TEST_WITH_PERIODIC=True):
+            class TestP(TestCase):
+                @periodic
+                def test_p(self):
+                    pass
+
+                def test_plain(self):
+                    pass
+
+        slow_tests = {"test_p (__main__.TestP)": None, "test_plain (__main__.TestP)": None}
+        with self._patch_test_env(TEST_WITH_PERIODIC=True, slow_tests_dict=slow_tests):
+            check_if_enable(TestP("test_p"))  # periodic overrides the dynamic slow mark
+            with self.assertRaisesRegex(unittest.SkipTest, "test is slow"):
+                check_if_enable(TestP("test_plain"))
+        with self._patch_test_env(TEST_WITH_SLOW=True, slow_tests_dict=slow_tests):
+            check_if_enable(TestP("test_plain"))
+
+    def test_check_if_enable_reruns_disabled_periodic_tests(self):
+        with self._patch_test_env(TEST_WITH_PERIODIC=True):
+            class TestP(TestCase):
+                @periodic
+                def test_p(self):
+                    pass
+
+                def test_plain(self):
+                    pass
+
+        disabled = {"test_p (__main__.TestP)": ("https://github.com/pytorch/pytorch/issues/1", [])}
+        with self._patch_test_env(TEST_WITH_PERIODIC=True, disabled_tests_dict=disabled):
+            with self.assertRaisesRegex(unittest.SkipTest, "disabling"):
+                check_if_enable(TestP("test_p"))
+        with self._patch_test_env(TEST_WITH_PERIODIC=True, RERUN_DISABLED_TESTS=True, disabled_tests_dict=disabled):
+            check_if_enable(TestP("test_p"))  # disabled periodic test is rerun
+            with self.assertRaisesRegex(unittest.SkipTest, "rerun-disabled-tests"):
+                check_if_enable(TestP("test_plain"))
+
+    def test_slowtest_gates_on_slow_mode(self):
+        class TestP(TestCase):
+            @slowTest
+            def test_s(self):
+                pass
+
+        with self._patch_test_env(), self.assertRaisesRegex(unittest.SkipTest, "test is slow"):
+            TestP("test_s").test_s()
+        with self._patch_test_env(TEST_WITH_SLOW=True):
+            TestP("test_s").test_s()
+
+    @parametrize(
+        "decorate",
+        [
+            subtest(lambda fn: periodic(slowTest(fn)), name="periodic_outside_slow"),
+            subtest(lambda fn: slowTest(periodic(fn)), name="slow_outside_periodic"),
+            subtest(
+                lambda fn: periodic(suppress_warnings(slowTest(fn))),
+                name="periodic_with_intervening_decorator",
+            ),
+        ],
+    )
+    def test_periodic_slowtest_mutual_exclusion(self, decorate):
+        def test_fn(self):
+            pass
+
+        with self.assertRaisesRegex(RuntimeError, "@periodic replaces @slowTest"):
+            decorate(test_fn)
+
+    def test_periodic_mode_enabled_in_periodic_workflows(self):
+        # Static validation of the periodic workflow files lives in
+        # .github/scripts/test_periodic_workflows.py; this checks end to end
+        # that periodic CI actually plumbed the flag through to the test env.
+        workflow = os.getenv("GITHUB_WORKFLOW", "")
+        # unstable-periodic parks flaky jobs from any workflow, so periodic
+        # tests are not necessarily enabled there.
+        if "periodic" not in workflow or workflow == "unstable-periodic":
+            self.skipTest("only meaningful inside a periodic CI workflow")
+        self.assertTrue(TEST_WITH_PERIODIC)
+
+    @periodic
+    def test_periodic_smoke(self):
+        self.assertTrue(TEST_WITH_PERIODIC)
+
+
+instantiate_parametrized_tests(TestPeriodicDecorator)
 
 
 class TestEnvironmentDefFlag(TestCase):
