@@ -304,7 +304,15 @@ def get_assignments_with_compile_ignored_comments(module: ModuleType) -> set[str
     return assignments
 
 
-_GetDictCacheKey = tuple[tuple[str, ...], tuple[str, ...], bool]
+# The trailing int is len(self._config) at cache time -- a registration
+# generation. In production _config only ever grows (__delattr__ hides rather
+# than pops), so add_config is the only mutation and len() is monotonic, which
+# is what makes it a sound cache key: any add_config invalidates every
+# context's cache, not just the one that registered the key (ContextVar.set is
+# context-scoped). Any future code that shrinks _config (e.g. an unregister
+# API, or test helpers that pop) MUST also clear _get_dict_cache_var, since len
+# is not injective over arbitrary key-set changes (see _remove_added_config).
+_GetDictCacheKey = tuple[tuple[str, ...], tuple[str, ...], bool, int]
 
 
 @dataclass
@@ -579,6 +587,7 @@ class ConfigModule(ModuleType):
             tuple(ignored_keys) if ignored_keys else (),
             tuple(ignored_prefixes) if ignored_prefixes else (),
             skip_default,
+            len(self._config),
         )
 
         # Try to take a shortcut and only update dirty keys on top of a cached base.
@@ -870,6 +879,59 @@ class ConfigModule(ModuleType):
                 from torch._dynamo.utils import warn_once
 
                 warn_once(f"key {k} with value {v} is not understood by this config")
+
+    def add_config(
+        self, name: str, config: "_Config", *, compile_ignored: bool = False
+    ) -> None:
+        """Register a config key post-install.
+
+        For out-of-tree backends to expose custom knobs through an installed
+        ConfigModule. The key flows through the normal __getattr__ /
+        __setattr__ / patch / get_config_copy / save_config / load_config
+        paths.
+
+        ``compile_ignored`` (default ``False``) excludes the key from
+        ``get_hash()`` only. It does *not* affect the Inductor FX graph cache
+        key, which is built from ``save_config_portable()`` and filtered by
+        the ``_`` prefix / ``_cache_config_ignore_prefix``. To keep a knob out
+        of the FX cache key, prefix it with ``_`` or add the prefix to
+        ``_cache_config_ignore_prefix``.
+
+        Structural registration is folded into the ``_get_dict`` cache key via
+        ``len(self._config)`` (a generation counter; ``_config`` only grows),
+        so a newly added key is visible to every thread/context, not just the
+        one that registered it. Calling this at backend import time, before
+        any compilation, is still best practice.
+
+        Raises AssertionError if ``name`` is already registered, shadows an
+        existing attribute on the module, or is not a valid Python identifier.
+        """
+        if not name.isidentifier() or keyword.iskeyword(name):
+            raise AssertionError(
+                f"invalid config name {name!r}: must be a valid Python identifier"
+            )
+        if name in self._config:
+            raise AssertionError(f"config {self.__name__}.{name} already exists")
+        # Reject names that already resolve on the module (sub-config proxies
+        # such as inductor's `triton`, ConfigModule methods like `patch`, and
+        # imports left in place by install_config_module): the entry would be
+        # exported by get_config_copy() / save_config_portable() (and thus land
+        # in the FX cache key) yet remain unreachable and unassignable via
+        # attribute access. Placed after the duplicate check because hasattr is
+        # also true for already-registered keys.
+        if hasattr(self, name):
+            raise AssertionError(
+                f"config name {name!r} shadows an existing {self.__name__} attribute"
+            )
+        self._config[name] = _ConfigEntry(config, name)
+        if compile_ignored:
+            self._compile_ignored_keys.add(name)
+        # Cross-context coherence comes from len(self._config) in the _get_dict
+        # cache key; these per-context dirty flags additionally cover the
+        # calling context's get_hash() cache (get_hash is not yet wired into
+        # the generation key -- see _get_dict if that changes).
+        self._hash_dirty_var.set(True)
+        self._get_dict_dirty_keys_var.set(None)
 
     def get_config_copy(self) -> dict[str, Any]:
         return self._get_dict()
