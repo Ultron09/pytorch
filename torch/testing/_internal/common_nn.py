@@ -3754,11 +3754,14 @@ class NewModuleTest(InputVariableMixin, ModuleTest):  # type: ignore[misc]
 
         def assert_module_parameters_are(tensor_type, device_id=None):
             for p in module.parameters():
-                if self.device is not None and "xpu" not in self.device.type:
-                    # https://github.com/intel/torch-xpu-ops/issues/2508
-                    test_case.assertIsInstance(p, tensor_type)
                 if device_id is not None:
+                    # tensor_type is a legacy CPU-only tensor class (e.g. torch.FloatTensor),
+                    # so isinstance() would incorrectly fail for accelerator tensors. Check
+                    # dtype and device separately instead.
+                    test_case.assertEqual(p.dtype, tensor_type.dtype)
                     test_case.assertEqual(p.get_device(), device_id)
+                else:
+                    test_case.assertIsInstance(p, tensor_type)
 
         if all(isinstance(t, torch.LongTensor) for t in input_tuple) and TEST_ACCELERATOR:
             # check that to(device) moves module parameters to correct GPU device,
