@@ -1,8 +1,17 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+
 #include <ATen/core/Tensor.h>
 #include <ATen/Dispatch.h>
 #include <ATen/ExpandUtils.h>
 #include <ATen/Config.h>
+#include <ATen/Parallel.h>
+#include <c10/util/bit_cast.h>
+#include <c10/util/irange.h>
 
 #include <ATen/native/mkldnn/Matmul.h>
 #include <ATen/native/mkldnn/Linear.h>
@@ -78,6 +87,26 @@ TORCH_META_FUNC(_scaled_mm_v2)(
   TORCH_CHECK_VALUE(self.dim() == 2, "mat_a must be a matrix");
   TORCH_CHECK_VALUE(mat2.dim() == 2, "mat_b must be a matrix");
 
+  std::vector<Tensor> scale_a_vec(scale_a.begin(), scale_a.end());
+  std::vector<Tensor> scale_b_vec(scale_b.begin(), scale_b.end());
+  auto recipe_a_enum =
+      scaled_blas::convert_int_to_enum<at::blas::ScalingType>(recipe_a);
+  auto recipe_b_enum =
+      scaled_blas::convert_int_to_enum<at::blas::ScalingType>(recipe_b);
+  auto swizzle_a_enum =
+      scaled_blas::convert_int_to_enum<at::blas::SwizzleType>(swizzle_a);
+  auto swizzle_b_enum =
+      scaled_blas::convert_int_to_enum<at::blas::SwizzleType>(swizzle_b);
+  const bool is_cpu_mxfp = scaled_blas::validate_cpu_mxfp_v2_inputs(
+      self,
+      scale_a_vec,
+      recipe_a_enum,
+      swizzle_a_enum,
+      scale_b_vec,
+      recipe_b_enum,
+      swizzle_b_enum,
+      contraction_dim);
+
   if (!contraction_dim.empty()) {
     TORCH_CHECK_VALUE(contraction_dim.size() == 2, "contraction_dim must have exactly 2 elements");
     auto mat_a_dim = contraction_dim[0];
@@ -96,18 +125,17 @@ TORCH_META_FUNC(_scaled_mm_v2)(
       !bias.has_value() || bias->sym_numel() == mat2.sym_size(1),
       "Bias must be size ", mat2.sym_size(1), " but got ", bias->sym_numel());
 
-  // Layout / per-recipe scale-shape validation. Materialize the lists so the
-  // helper sees ArrayRef<Tensor> rather than ITensorListRef.
-  std::vector<Tensor> scale_a_vec(scale_a.begin(), scale_a.end());
-  std::vector<Tensor> scale_b_vec(scale_b.begin(), scale_b.end());
-  auto recipe_a_enum = scaled_blas::convert_int_to_enum<at::blas::ScalingType>(recipe_a);
-  auto recipe_b_enum = scaled_blas::convert_int_to_enum<at::blas::ScalingType>(recipe_b);
-  auto swizzle_a_enum = scaled_blas::convert_int_to_enum<at::blas::SwizzleType>(swizzle_a);
-  auto swizzle_b_enum = scaled_blas::convert_int_to_enum<at::blas::SwizzleType>(swizzle_b);
-  scaled_blas::validate_scaled_mm_v2_inputs(
-      self, mat2,
-      scale_a_vec, recipe_a_enum, swizzle_a_enum,
-      scale_b_vec, recipe_b_enum, swizzle_b_enum);
+  if (!is_cpu_mxfp) {
+    scaled_blas::validate_scaled_mm_v2_inputs(
+        self,
+        mat2,
+        scale_a_vec,
+        recipe_a_enum,
+        swizzle_a_enum,
+        scale_b_vec,
+        recipe_b_enum,
+        swizzle_b_enum);
+  }
 
   const auto out_dtype_ = out_dtype.value_or(self.scalar_type());
   set_output_raw_strided(
@@ -240,6 +268,301 @@ std::pair<ScalingType, ScalingType> get_joint_scaling(
   }
   invalid_scaling_config(mat_a, mat_b, scale_a, scale_b);
   return {};
+}
+
+bool is_mxfp_scale(const Tensor& scale) {
+  return scale.scalar_type() == ScalarType::Float8_e8m0fnu;
+}
+
+void validate_mxfp_cpu(
+    const Tensor& mat_a,
+    const Tensor& mat_b,
+    const Tensor& scale_a,
+    const Tensor& scale_b,
+    const std::optional<Tensor>& bias,
+    const Tensor& out,
+    bool v2_scale_b_layout) {
+  TORCH_CHECK_VALUE(
+      mat_a.dim() == 2 && mat_b.dim() == 2, "MXFP operands must be matrices");
+  TORCH_CHECK_VALUE(
+      is_mxfp_scale(scale_a) && is_mxfp_scale(scale_b),
+      "MXFP scales must both have dtype Float8_e8m0fnu");
+
+  const auto input_dtype = mat_a.scalar_type();
+  const bool is_mxfp4 = input_dtype == ScalarType::Float4_e2m1fn_x2;
+  TORCH_CHECK_VALUE(
+      mat_b.scalar_type() == input_dtype &&
+          (is_mxfp4 || input_dtype == ScalarType::Float8_e4m3fn),
+      "MXFP operands must both have dtype Float8_e4m3fn or Float4_e2m1fn_x2");
+
+  const int64_t packing = is_mxfp4 ? 2 : 1;
+  const int64_t logical_k = packing * mat_a.size(1);
+  TORCH_CHECK_VALUE(
+      logical_k == packing * mat_b.size(0),
+      "MXFP operand shapes cannot be multiplied: ",
+      mat_a.sizes(),
+      " and ",
+      mat_b.sizes());
+  const int64_t k_blocks = (logical_k + 31) / 32;
+  TORCH_CHECK_VALUE(
+      scale_a.dim() == 2 && scale_a.size(0) == mat_a.size(0) &&
+          scale_a.size(1) == k_blocks,
+      "MXFP scale_a must have shape (", mat_a.size(0), ", ", k_blocks,
+      "), got ", scale_a.sizes());
+  const int64_t scale_b_dim0 = v2_scale_b_layout ? mat_b.size(1) : k_blocks;
+  const int64_t scale_b_dim1 = v2_scale_b_layout ? k_blocks : mat_b.size(1);
+  TORCH_CHECK_VALUE(
+      scale_b.dim() == 2 && scale_b.size(0) == scale_b_dim0 &&
+          scale_b.size(1) == scale_b_dim1,
+      "MXFP scale_b must have shape (", scale_b_dim0, ", ", scale_b_dim1,
+      "), got ", scale_b.sizes());
+  TORCH_CHECK_VALUE(
+      scale_a.is_contiguous(), "MXFP scale_a must be contiguous");
+  TORCH_CHECK_VALUE(
+      scale_b.is_contiguous(), "MXFP scale_b must be contiguous");
+  TORCH_CHECK_VALUE(mat_a.is_contiguous(), "MXFP mat_a must be row-major");
+  TORCH_CHECK_VALUE(
+      mat_b.size(0) == 0 ||
+          (mat_b.stride(0) == 1 && mat_b.stride(1) == mat_b.size(0)),
+      "MXFP mat_b must be column-major");
+  TORCH_CHECK_VALUE(
+      out.scalar_type() == ScalarType::BFloat16 ||
+          out.scalar_type() == ScalarType::Float,
+      "CPU MXFP output must have dtype BFloat16 or Float32, got ",
+      out.scalar_type());
+  TORCH_CHECK_VALUE(out.is_contiguous(), "CPU MXFP output must be contiguous");
+  TORCH_CHECK_VALUE(
+      !bias.has_value() || bias->numel() == mat_b.size(1),
+      "Bias must be size ",
+      mat_b.size(1),
+      " but got ",
+      bias.has_value() ? bias->numel() : 0);
+  TORCH_CHECK_VALUE(
+      !bias.has_value() || bias->scalar_type() == ScalarType::BFloat16 ||
+          bias->scalar_type() == ScalarType::Float,
+      "CPU MXFP bias must have dtype BFloat16 or Float32, got ",
+      bias.has_value() ? bias->scalar_type() : ScalarType::Undefined);
+}
+
+constexpr std::array<float, 16> mxfp4_values = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+constexpr auto mxfp8_values = []() constexpr {
+  constexpr std::array<float, 16> exponents = {
+      0.0f, 0.015625f, 0.03125f, 0.0625f, 0.125f, 0.25f, 0.5f,
+      1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f, 128.0f, 256.0f};
+  std::array<float, 256> values{};
+  for (int encoding = 0; encoding < 256; ++encoding) {
+    const int exponent = (encoding >> 3) & 0x0f;
+    const int mantissa = encoding & 0x07;
+    float value = exponent == 0
+        ? static_cast<float>(mantissa) / 512.0f
+        : (1.0f + static_cast<float>(mantissa) / 8.0f) *
+            exponents[exponent];
+    if (exponent == 0x0f && mantissa == 0x07) {
+      value = std::numeric_limits<float>::quiet_NaN();
+    }
+    values[encoding] = encoding & 0x80 ? -value : value;
+  }
+  return values;
+}();
+
+C10_ALWAYS_INLINE float apply_mxfp_scale(
+    float value, uint8_t scale_a, uint8_t scale_b) {
+  if (scale_a == 0xff || scale_b == 0xff) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  const int exponent = static_cast<int>(scale_a) +
+      static_cast<int>(scale_b) - 254;
+  const int biased_exponent = exponent + 127;
+  if (biased_exponent > 0 && biased_exponent < 255) {
+    const auto bits = static_cast<uint32_t>(biased_exponent) << 23;
+    return value * c10::bit_cast<float>(bits);
+  }
+  return std::scalbn(value, exponent);
+}
+
+Tensor& mxfp_scaled_mm_cpu_reference(
+    const Tensor& mat_a,
+    const Tensor& mat_b,
+    const Tensor& scale_a,
+    const Tensor& scale_b_input,
+    const std::optional<Tensor>& bias,
+    Tensor& out,
+    bool v2_scale_b_layout = false) {
+  validate_mxfp_cpu(
+      mat_a, mat_b, scale_a, scale_b_input, bias, out, v2_scale_b_layout);
+  at::native::resize_output(out, {mat_a.size(0), mat_b.size(1)});
+  if (out.numel() == 0) {
+    return out;
+  }
+  const Tensor bias_data = bias.has_value()
+      ? bias->contiguous().view({-1})
+      : Tensor{};
+  if (mat_a.size(1) == 0) {
+    out.zero_();
+    if (bias_data.defined()) {
+      out.add_(bias_data);
+    }
+    return out;
+  }
+  const Tensor scale_b =
+      v2_scale_b_layout ? scale_b_input.t().contiguous() : scale_b_input;
+  const bool is_fp4 = mat_a.scalar_type() == ScalarType::Float4_e2m1fn_x2;
+  const int64_t m = mat_a.size(0);
+  const int64_t k = mat_a.size(1) * (is_fp4 ? 2 : 1);
+  const int64_t n = mat_b.size(1);
+  const int64_t groups = (k + 31) / 32;
+  const auto* scale_a_data = scale_a.const_data_ptr<c10::Float8_e8m0fnu>();
+  const auto* scale_b_data = scale_b.const_data_ptr<c10::Float8_e8m0fnu>();
+  const auto* bias_f32 =
+      bias_data.defined() && bias_data.scalar_type() == ScalarType::Float
+      ? bias_data.const_data_ptr<float>()
+      : nullptr;
+  const auto* bias_bf16 =
+      bias_data.defined() && bias_data.scalar_type() == ScalarType::BFloat16
+      ? bias_data.const_data_ptr<c10::BFloat16>()
+      : nullptr;
+  auto* out_f32 = out.scalar_type() == ScalarType::Float
+      ? out.mutable_data_ptr<float>()
+      : nullptr;
+  auto* out_bf16 = out.scalar_type() == ScalarType::BFloat16
+      ? out.mutable_data_ptr<c10::BFloat16>()
+      : nullptr;
+
+  auto run = [&](auto load_a, auto load_b) {
+    constexpr int output_tile = 4;
+    constexpr float nan = std::numeric_limits<float>::quiet_NaN();
+    const int64_t tiles_per_row = n / output_tile + (n % output_tile != 0);
+    const int64_t grain_size = std::max<int64_t>(
+        1, at::internal::GRAIN_SIZE / (k * output_tile));
+    auto store_result = [&](int64_t row, int64_t column, float result) {
+      if (bias_f32 != nullptr) {
+        result += bias_f32[column];
+      } else if (bias_bf16 != nullptr) {
+        result += static_cast<float>(bias_bf16[column]);
+      }
+      const int64_t index = row * n + column;
+      if (out_f32 != nullptr) {
+        out_f32[index] = result;
+      } else {
+        out_bf16[index] = c10::BFloat16(result);
+      }
+    };
+    at::parallel_for(
+        0, m * tiles_per_row, grain_size, [&](int64_t begin, int64_t end) {
+          for (const auto index : c10::irange(begin, end)) {
+            const int64_t row = index / tiles_per_row;
+            const int64_t column = index % tiles_per_row * output_tile;
+            if (column + output_tile <= n) {
+              float result0 = 0.0f;
+              float result1 = 0.0f;
+              float result2 = 0.0f;
+              float result3 = 0.0f;
+              for (const auto group : c10::irange(groups)) {
+                float partial0 = 0.0f;
+                float partial1 = 0.0f;
+                float partial2 = 0.0f;
+                float partial3 = 0.0f;
+                const int64_t group_start = group * 32;
+                auto accumulate = [&](int64_t offset) {
+                  const int64_t inner = group_start + offset;
+                  const float value_a = load_a(row, inner);
+                  partial0 += value_a * load_b(inner, column);
+                  partial1 += value_a * load_b(inner, column + 1);
+                  partial2 += value_a * load_b(inner, column + 2);
+                  partial3 += value_a * load_b(inner, column + 3);
+                };
+                if (group_start + 32 <= k) {
+                  for (const auto offset : c10::irange(32)) {
+                    accumulate(offset);
+                  }
+                } else {
+                  for (const auto offset : c10::irange(k - group_start)) {
+                    accumulate(offset);
+                  }
+                }
+                const uint8_t scale_a_encoding =
+                    scale_a_data[row * groups + group].x;
+                if (scale_a_encoding == 0xff) {
+                  result0 = result1 = result2 = result3 = nan;
+                  break;
+                }
+                const auto* scales_b =
+                    scale_b_data + group * n + column;
+                result0 += apply_mxfp_scale(
+                    partial0, scale_a_encoding, scales_b[0].x);
+                result1 += apply_mxfp_scale(
+                    partial1, scale_a_encoding, scales_b[1].x);
+                result2 += apply_mxfp_scale(
+                    partial2, scale_a_encoding, scales_b[2].x);
+                result3 += apply_mxfp_scale(
+                    partial3, scale_a_encoding, scales_b[3].x);
+              }
+              store_result(row, column, result0);
+              store_result(row, column + 1, result1);
+              store_result(row, column + 2, result2);
+              store_result(row, column + 3, result3);
+              continue;
+            }
+            for (int64_t tail_column = column; tail_column < n;
+                 ++tail_column) {
+              float result = 0.0f;
+              for (const auto group : c10::irange(groups)) {
+                float partial = 0.0f;
+                const int64_t group_start = group * 32;
+                auto accumulate = [&](int64_t offset) {
+                  const int64_t inner = group_start + offset;
+                  partial +=
+                      load_a(row, inner) * load_b(inner, tail_column);
+                };
+                if (group_start + 32 <= k) {
+                  for (const auto offset : c10::irange(32)) {
+                    accumulate(offset);
+                  }
+                } else {
+                  for (const auto offset : c10::irange(k - group_start)) {
+                    accumulate(offset);
+                  }
+                }
+                const uint8_t scale_a_encoding =
+                    scale_a_data[row * groups + group].x;
+                const uint8_t scale_b_encoding =
+                    scale_b_data[group * n + tail_column].x;
+                result +=
+                    apply_mxfp_scale(partial, scale_a_encoding, scale_b_encoding);
+              }
+              store_result(row, tail_column, result);
+            }
+          }
+        });
+  };
+
+  if (is_fp4) {
+    const int64_t packed_k = k / 2;
+    const auto* a = static_cast<const uint8_t*>(mat_a.const_data_ptr());
+    const auto* b = static_cast<const uint8_t*>(mat_b.const_data_ptr());
+    run(
+        [&](int64_t row, int64_t inner) {
+          const uint8_t packed = a[row * packed_k + inner / 2];
+          return mxfp4_values[(packed >> (4 * (inner % 2))) & 0x0f];
+        },
+        [&](int64_t inner, int64_t column) {
+          const uint8_t packed = b[column * packed_k + inner / 2];
+          return mxfp4_values[(packed >> (4 * (inner % 2))) & 0x0f];
+        });
+  } else {
+    const auto* a = mat_a.const_data_ptr<c10::Float8_e4m3fn>();
+    const auto* b = mat_b.const_data_ptr<c10::Float8_e4m3fn>();
+    run(
+        [&](int64_t row, int64_t inner) {
+          return mxfp8_values[a[row * k + inner].x];
+        },
+        [&](int64_t inner, int64_t column) {
+          return mxfp8_values[b[column * k + inner].x];
+        });
+  }
+  return out;
 }
 
 } // namespace
@@ -375,6 +698,20 @@ _scaled_mm_out_cpu(const Tensor& mat1, const Tensor& mat2,
           std::optional<c10::ScalarType> out_dtype,
           bool use_fast_accum,
           Tensor& out) {
+  if (is_mxfp_scale(scale_a) || is_mxfp_scale(scale_b)) {
+    TORCH_CHECK_NOT_IMPLEMENTED(
+        !scale_result.has_value(), "CPU MXFP does not support scale_result");
+    TORCH_CHECK_VALUE(
+        !out_dtype || *out_dtype == out.scalar_type(),
+        "out_dtype must match output matrix type");
+    return mxfp_scaled_mm_cpu_reference(
+        mat1,
+        mat2,
+        scale_a,
+        scale_b,
+        bias,
+        out);
+  }
 #if AT_MKLDNN_ENABLED() && !defined(__powerpc__)
   if (at::globalContext().userEnabledMkldnn() && scale_a.numel() == 1 && scale_b.numel() == 1) {
     bool mixed_dtype = mat1.scalar_type() != mat2.scalar_type();
@@ -469,6 +806,35 @@ TORCH_IMPL_FUNC(_scaled_mm_cpu_v2_out)(
   ArrayRef<Tensor> scale_a_ref(scale_a);
   ArrayRef<Tensor> scale_b_ref(scale_b);
 
+  // Conversion of implicitly-defined enums to explicit
+  auto scale_recipe_a_enum = convert_int_to_enum<ScalingType>(scale_recipe_a);
+  auto swizzle_a_enum = convert_int_to_enum<SwizzleType>(swizzle_a);
+  auto scale_recipe_b_enum = convert_int_to_enum<ScalingType>(scale_recipe_b);
+  auto swizzle_b_enum = convert_int_to_enum<SwizzleType>(swizzle_b);
+  std::optional<Tensor> bias_opt = bias.has_value()
+      ? std::optional<Tensor>{*bias}
+      : std::optional<Tensor>{std::nullopt};
+
+  if (scaled_blas::validate_cpu_mxfp_v2_inputs(
+          mat_a,
+          scale_a_ref,
+          scale_recipe_a_enum,
+          swizzle_a_enum,
+          scale_b_ref,
+          scale_recipe_b_enum,
+          swizzle_b_enum,
+          contraction_dim)) {
+    mxfp_scaled_mm_cpu_reference(
+        mat_a,
+        mat_b,
+        scale_a[0],
+        scale_b[0],
+        bias_opt,
+        const_cast<Tensor&>(out),
+        true);
+    return;
+  }
+
   // If any of M, K, N is 0 - return early (the tensorwise/rowwise float8 gemm kernels
   // do not support this case). The output has already been sized by the
   // structured-op meta function; we only need to zero-fill when K=0.
@@ -487,12 +853,6 @@ TORCH_IMPL_FUNC(_scaled_mm_cpu_v2_out)(
         "Bias must be Float32 or BFloat16 or Half, but got ",
         bias->scalar_type());
   }
-
-  // Conversion of implicitly-defined enums to explicit
-  auto scale_recipe_a_enum = convert_int_to_enum<ScalingType>(scale_recipe_a);
-  auto swizzle_a_enum = convert_int_to_enum<SwizzleType>(swizzle_a);
-  auto scale_recipe_b_enum = convert_int_to_enum<ScalingType>(scale_recipe_b);
-  auto swizzle_b_enum = convert_int_to_enum<SwizzleType>(swizzle_b);
 
   if (!swizzle_a_enum.empty() && !swizzle_b_enum.empty()) {
     TORCH_CHECK_VALUE(
@@ -521,10 +881,6 @@ TORCH_IMPL_FUNC(_scaled_mm_cpu_v2_out)(
 
     invalid_scaling_config(mat_a, mat_b, scale_a_opt, scale_b_opt);
   }
-
-  std::optional<Tensor> bias_opt = bias.has_value()
-      ? std::optional<Tensor>{*bias}
-      : std::optional<Tensor>{std::nullopt};
 
   if (gemm_impl == ScaledGemmImplementation::TENSORWISE_TENSORWISE ||
       gemm_impl == ScaledGemmImplementation::ROWWISE_ROWWISE) {
