@@ -193,6 +193,19 @@ def has_triton_stable_tma_api() -> bool:
 
 
 @functools.cache
+def has_triton_reduction_ordering() -> bool:
+    """Whether the available Triton exposes inner-tree reduction ordering."""
+    if has_triton_package():
+        try:
+            from triton.language import ReductionOrdering
+
+            return hasattr(ReductionOrdering, "INNER_TREE")
+        except ImportError:
+            pass
+    return False
+
+
+@functools.cache
 def has_triton() -> bool:
     if not has_triton_package():
         return False
@@ -202,26 +215,30 @@ def has_triton() -> bool:
     if triton_disable_device_detection:
         return False
 
-    # Walk the registered DeviceInterface registry.  is_triton_capable()
-    # is gated first so that raise_if_triton_unavailable() only surfaces
-    # missing-backend RuntimeErrors (and not, e.g., CUDA's
-    # GPUTooOldForTriton for sub-capable devices).  Partially-implemented
-    # out-of-tree interfaces that omit is_available / is_triton_capable
-    # are silently skipped.
     from torch._dynamo.device_interface import get_registered_device_interfaces
+    from torch._dynamo.exc import TritonUnavailableError
 
-    for name, iface in get_registered_device_interfaces():
+    # A device supports Triton if it is available, reports Triton capability,
+    # and its Triton backend is actually built.  Capability is gated first so
+    # that raise_if_triton_unavailable() only surfaces missing-backend errors
+    # (and not, e.g., CUDA's GPUTooOldForTriton for sub-capable devices).
+    # Partially-implemented out-of-tree interfaces that omit is_available /
+    # is_triton_capable are silently skipped.
+    for name, device_interface in get_registered_device_interfaces():
         if ":" in name:
             continue
         try:
-            has_triton_support = iface.is_available() and iface.is_triton_capable()
+            has_triton_support = (
+                device_interface.is_availabl
+                and device_interface.is_triton_capable()
+            )
         except NotImplementedError:
             continue
         if not has_triton_support:
             continue
         try:
-            iface.raise_if_triton_unavailable()
-        except RuntimeError:
+            device_interface.raise_if_triton
+        except TritonUnavailableError:
             continue
         return True
     return False
