@@ -941,10 +941,11 @@ def get_scaling_options(
     )  # verify that shapes are supported by at least one existing pairing
 
 
-# Inductor has no template or extern choice that understands swizzled scale
-# layouts for _scaled_mm_v2 yet; defer those to the eager op. add_to_fallback_set
-# is False because this handler is invoked manually from the lowering below, not
-# registered as the op's global fallback.
+# These exact fallbacks are invoked manually for configurations that no
+# Inductor template or equivalent extern choice supports.
+scaled_mm_fallback = fallback_handler(
+    aten._scaled_mm.default, add_to_fallback_set=False
+)
 scaled_mm_v2_fallback = fallback_handler(
     aten._scaled_mm_v2.default, add_to_fallback_set=False
 )
@@ -1198,6 +1199,20 @@ def tuned_scaled_mm(
     Returns:
         Tensor: The result of the scaled matrix multiplication
     """
+    if mat_a.get_device().type == "cpu" and (
+        scale_a.dtype == torch.float8_e8m0fnu or scale_b.dtype == torch.float8_e8m0fnu
+    ):
+        return scaled_mm_fallback(
+            mat_a,
+            mat_b,
+            scale_a,
+            scale_b,
+            bias,
+            scale_result,
+            out_dtype,
+            use_fast_accum,
+        )
+
     # TODO(coconutruben): integrate into MMKernelInputs when all callsites use that
     m, n, k, layout, mat_a, mat_b = mm_args(
         mat_a, mat_b, layout=layout, out_dtype=out_dtype
