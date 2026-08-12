@@ -12518,6 +12518,9 @@ op_db: list[OpInfo] = [
                    "test_dtensor_op_db",
                    dtypes=(torch.float32,),
                ),
+               # torch-xpu-ops/issues/4932
+               DecorateInfo(unittest.expectedFailure, 'TestDecomp', 'test_quick', device_type='xpu',
+                            dtypes=(torch.uint8,)),
            ],
            sample_inputs_func=sample_inputs_mv),
     OpInfo('addr',
@@ -17236,7 +17239,12 @@ op_db: list[OpInfo] = [
             DecorateInfo(unittest.skip('test_cow_input does not work with efficient attention on ROCM'),
                          'TestCompositeCompliance', 'test_cow_input',
                          device_type='cuda', dtypes=(torch.bfloat16, torch.float16, torch.float32),
-                         active_if=TEST_WITH_ROCM and PLATFORM_SUPPORTS_MEM_EFF_ATTENTION),),
+                         active_if=TEST_WITH_ROCM and PLATFORM_SUPPORTS_MEM_EFF_ATTENTION),
+            # torch-xpu/issues/4461
+            DecorateInfo(unittest.expectedFailure, 'TestMeta', 'test_meta_outplace',
+                         device_type='xpu', dtypes=(torch.uint8, torch.int8)),
+            DecorateInfo(unittest.expectedFailure, 'TestMeta', 'test_dispatch_symbolic_meta_outplace',
+                         device_type='xpu', dtypes=(torch.uint8, torch.int8)),),
     ),
     OpInfo(
         'torch.ops.aten._flash_attention_forward',
@@ -24447,7 +24455,7 @@ python_ref_db = [
                          'test_python_ref_torch_fallback'),
             DecorateInfo(unittest.skip("Expected: dropout is not comparable"),
                          'TestCommon',
-                         'test_python_ref_executor', device_type='cuda'),
+                         'test_python_ref_executor', device_type=('cuda', 'xpu')),
             # AssertionError: Tensor-likes are not close!
             DecorateInfo(unittest.skip("Expected: dropout is not comparable"),
                          'TestMathBits',
