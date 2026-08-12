@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterable
 from typing import cast, TYPE_CHECKING
 
 from torch import SymInt
+from torch._library.fake_class_registry import maybe_unwrap_fake_script_object
 
 from .codegen import _compile_and_exec_source, PySourceBuilder
 from .schemas import ActInputPaths, OpaqueMeta, PlainTensorMeta, SubclassCreationMeta
@@ -539,6 +540,14 @@ def _codegen_subclass_wrapper_source(
 
     # --- Call compiled function ---
     state.emit("unwrapped_outs = compiled_fn(unwrapped_args)")
+
+    # Opaque constants are stored as FakeScriptObject in the compiled graph;
+    # unwrap them back to real objects (no-op for tensors and SymInts).
+    unwrap_fn = state.add_global(
+        state.fresh_name("_unwrap_fake_obj"),
+        maybe_unwrap_fake_script_object,
+    )
+    state.emit(f"unwrapped_outs = [{unwrap_fn}(o) for o in unwrapped_outs]")
 
     # --- Output wrapping ---
     result_exprs, _ = _emit_output_wrapping(state, out_metas, num_fw_outs_saved_for_bw)

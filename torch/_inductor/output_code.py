@@ -82,6 +82,14 @@ if TYPE_CHECKING:
     # exactly this shape, so we name it rather than repeating Callable[..., Any].
     _BoxedCallable: TypeAlias = Callable[[Sequence[InputType]], object]
 
+    # Value type for the constants dict passed through unwrap() and consumed by
+    # PyCodeCache.load_by_key_path / cudagraph post-compile.  Includes bare
+    # `type` because opaque_value_type_classes maps names to subclass type objects
+    # needed for isinstance checks in generated code.
+    _ConstantValue: TypeAlias = (
+        torch.Tensor | torch._C.ScriptObject | FakeScriptObject | type
+    )
+
     class CompiledFnRunner(Protocol):
         """Runner emitted by the Python wrapper when graph_partition is on.
 
@@ -231,7 +239,7 @@ def cudagraph_post_compile(
     example_inputs: Sequence[InputType],
     compiled_graph: CompiledFxGraph,
     cudagraphs: BoxedBool,
-    constants: dict[str, torch.Tensor | type],
+    constants: dict[str, _ConstantValue],
     boxed_forward_device_index: BoxedDeviceIndex | None,
 ) -> None:
     """
@@ -332,7 +340,7 @@ def cudagraph_partition_post_compile(
     example_inputs: Sequence[InputType],
     compiled_graph: CompiledFxGraph,
     cudagraphs: BoxedBool,
-    constants: dict[str, torch.Tensor | type],
+    constants: dict[str, _ConstantValue],
     boxed_forward_device_index: BoxedDeviceIndex | None,
 ) -> None:
     """
@@ -485,10 +493,14 @@ class CompiledFxGraphConstants:
     the value of constants directly off of the original saved object.
     """
 
-    def unwrap(self, g: CompiledFxGraph) -> dict[str, torch.Tensor | type]:
+    def unwrap(self, g: CompiledFxGraph) -> dict[str, _ConstantValue]:
         if g.constants is None:
             raise AssertionError("g.constants must not be None")
-        return {**g.constants, **g.opaque_value_type_classes}
+        return {
+            **g.constants,
+            **g.torchbind_constants,
+            **g.opaque_value_type_classes,
+        }
 
 
 class CompiledFxGraphConstantsWithGm(CompiledFxGraphConstants):
@@ -503,13 +515,18 @@ class CompiledFxGraphConstantsWithGm(CompiledFxGraphConstants):
     def __init__(self, gm: torch.fx.GraphModule) -> None:
         self.gm = gm
 
-    def unwrap(self, g: CompiledFxGraph) -> dict[str, torch.Tensor | type]:
+    def unwrap(self, g: CompiledFxGraph) -> dict[str, _ConstantValue]:
         frozen_params = {
             name: getattr(self.gm, orig_name)
             for name, orig_name in g.frozen_param_names.items()
         }
         constants = g.constants or {}
-        return {**constants, **frozen_params, **g.opaque_value_type_classes}
+        return {
+            **constants,
+            **frozen_params,
+            **g.torchbind_constants,
+            **g.opaque_value_type_classes,
+        }
 
 
 @dataclasses.dataclass

@@ -108,17 +108,18 @@ def inner_fn(args):
     unwrapped_args.extend(args[1:])
     args.clear()
     unwrapped_outs = compiled_fn(unwrapped_args)
+    unwrapped_outs = [_unwrap_fake_obj_2(o) for o in unwrapped_outs]
     _out_idx = 0
     _num_wrapped_outs = len(unwrapped_outs)
     assert _num_wrapped_outs == 2, f'expected 2 wrapped outputs, got {_num_wrapped_outs}'
-    _out_attr_3 = unwrapped_outs[_out_idx]
-    _out_idx += 1
     _out_attr_4 = unwrapped_outs[_out_idx]
     _out_idx += 1
-    _out_inner_2 = {'a': _out_attr_3, 'b': _out_attr_4}
-    _out_7 = _subclass_type_5.__tensor_unflatten__(_out_inner_2, _meta_6, _out_attr_3.size(), _out_attr_3.stride())
+    _out_attr_5 = unwrapped_outs[_out_idx]
+    _out_idx += 1
+    _out_inner_3 = {'a': _out_attr_4, 'b': _out_attr_5}
+    _out_8 = _subclass_type_6.__tensor_unflatten__(_out_inner_3, _meta_7, _out_attr_4.size(), _out_attr_4.stride())
     assert _out_idx == _num_wrapped_outs, f'wrapped {_out_idx} outputs, expected {_num_wrapped_outs}'
-    return (_out_7,)""",
+    return (_out_8,)""",
         )
 
     def test_compile_nested_subclass(self):
@@ -161,25 +162,26 @@ def inner_fn(args):
     unwrapped_args.extend(args[1:])
     args.clear()
     unwrapped_outs = compiled_fn(unwrapped_args)
+    unwrapped_outs = [_unwrap_fake_obj_4(o) for o in unwrapped_outs]
     _out_idx = 0
     _num_wrapped_outs = len(unwrapped_outs)
     assert _num_wrapped_outs == 4, f'expected 4 wrapped outputs, got {_num_wrapped_outs}'
-    _out_attr_6 = unwrapped_outs[_out_idx]
-    _out_idx += 1
     _out_attr_7 = unwrapped_outs[_out_idx]
     _out_idx += 1
-    _out_inner_5 = {'a': _out_attr_6, 'b': _out_attr_7}
-    _out_10 = _subclass_type_8.__tensor_unflatten__(_out_inner_5, _meta_9, _out_attr_6.size(), _out_attr_6.stride())
-    _out_attr_12 = unwrapped_outs[_out_idx]
+    _out_attr_8 = unwrapped_outs[_out_idx]
     _out_idx += 1
+    _out_inner_6 = {'a': _out_attr_7, 'b': _out_attr_8}
+    _out_11 = _subclass_type_9.__tensor_unflatten__(_out_inner_6, _meta_10, _out_attr_7.size(), _out_attr_7.stride())
     _out_attr_13 = unwrapped_outs[_out_idx]
     _out_idx += 1
-    _out_inner_11 = {'a': _out_attr_12, 'b': _out_attr_13}
-    _out_16 = _subclass_type_14.__tensor_unflatten__(_out_inner_11, _meta_15, _out_attr_12.size(), _out_attr_12.stride())
-    _out_inner_4 = {'a': _out_10, 'b': _out_16}
-    _out_19 = _subclass_type_17.__tensor_unflatten__(_out_inner_4, _meta_18, _out_10.size(), _out_10.stride())
+    _out_attr_14 = unwrapped_outs[_out_idx]
+    _out_idx += 1
+    _out_inner_12 = {'a': _out_attr_13, 'b': _out_attr_14}
+    _out_17 = _subclass_type_15.__tensor_unflatten__(_out_inner_12, _meta_16, _out_attr_13.size(), _out_attr_13.stride())
+    _out_inner_5 = {'a': _out_11, 'b': _out_17}
+    _out_20 = _subclass_type_18.__tensor_unflatten__(_out_inner_5, _meta_19, _out_11.size(), _out_11.stride())
     assert _out_idx == _num_wrapped_outs, f'wrapped {_out_idx} outputs, expected {_num_wrapped_outs}'
-    return (_out_19,)""",
+    return (_out_20,)""",
         )
 
     @unittest.skipIf(not torch.distributed.is_available(), "requires distributed")
@@ -201,13 +203,14 @@ def inner_fn(args):
     unwrapped_args.extend(args[1:])
     args.clear()
     unwrapped_outs = compiled_fn(unwrapped_args)
+    unwrapped_outs = [_unwrap_fake_obj_1(o) for o in unwrapped_outs]
     _out_idx = 0
     _num_wrapped_outs = len(unwrapped_outs)
     assert _num_wrapped_outs == 1, f'expected 1 wrapped outputs, got {_num_wrapped_outs}'
-    _out_plain_1 = unwrapped_outs[_out_idx]
+    _out_plain_2 = unwrapped_outs[_out_idx]
     _out_idx += 1
     assert _out_idx == _num_wrapped_outs, f'wrapped {_out_idx} outputs, expected {_num_wrapped_outs}'
-    return (_out_plain_1,)""",
+    return (_out_plain_2,)""",
         )
 
     @unittest.skipIf(not torch.distributed.is_available(), "requires distributed")
@@ -233,13 +236,14 @@ def inner_fn(args):
     unwrapped_args.extend(args[1:])
     args.clear()
     unwrapped_outs = compiled_fn(unwrapped_args)
+    unwrapped_outs = [_unwrap_fake_obj_4(o) for o in unwrapped_outs]
     _out_idx = 0
     _num_wrapped_outs = len(unwrapped_outs)
     assert _num_wrapped_outs == 1, f'expected 1 wrapped outputs, got {_num_wrapped_outs}'
-    _out_plain_4 = unwrapped_outs[_out_idx]
+    _out_plain_5 = unwrapped_outs[_out_idx]
     _out_idx += 1
     assert _out_idx == _num_wrapped_outs, f'wrapped {_out_idx} outputs, expected {_num_wrapped_outs}'
-    return (_out_plain_4,)""",
+    return (_out_plain_5,)""",
         )
 
     def test_trailing_args_forwarded(self):
