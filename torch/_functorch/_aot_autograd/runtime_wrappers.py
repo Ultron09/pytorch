@@ -1454,6 +1454,9 @@ class AOTDispatchSubclassWrapper(CompilerWrapper):
 
         from .subclass_codegen import codegen_subclass_wrapper
 
+        has_opaque_outputs = any(
+            is_custom_class(info.raw_type) for info in runtime_metadata.output_info
+        )
         inner_fn = codegen_subclass_wrapper(
             compiled_fn=compiled_fn,
             inp_metas=runtime_metadata.subclass_inp_meta,
@@ -1461,6 +1464,7 @@ class AOTDispatchSubclassWrapper(CompilerWrapper):
             num_fw_outs_saved_for_bw=self.num_fw_outs_saved_for_bw,
             frozen_inp_indices=self._get_frozen_inp_indices(),
             act_input_paths=runtime_metadata.act_input_paths,
+            has_opaque_outputs=has_opaque_outputs,
         )
         inner_fn._boxed_call = True  # type: ignore[attr-defined]
         return inner_fn

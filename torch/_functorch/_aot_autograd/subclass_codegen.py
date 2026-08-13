@@ -498,6 +498,8 @@ def _codegen_subclass_wrapper_source(
     num_fw_outs_saved_for_bw: int | None,
     frozen_inp_indices: frozenset[int] = frozenset(),
     act_input_paths: ActInputPaths | None = None,
+    *,
+    has_opaque_outputs: bool = False,
 ) -> tuple[str, dict[str, object]]:
     """Generate source and globals for a subclass wrapper.
 
@@ -543,11 +545,12 @@ def _codegen_subclass_wrapper_source(
 
     # Opaque constants are stored as FakeScriptObject in the compiled graph;
     # unwrap them back to real objects (no-op for tensors and SymInts).
-    unwrap_fn = state.add_global(
-        state.fresh_name("_unwrap_fake_obj"),
-        maybe_unwrap_fake_script_object,
-    )
-    state.emit(f"unwrapped_outs = [{unwrap_fn}(o) for o in unwrapped_outs]")
+    if has_opaque_outputs:
+        unwrap_fn = state.add_global(
+            state.fresh_name("_unwrap_fake_obj"),
+            maybe_unwrap_fake_script_object,
+        )
+        state.emit(f"unwrapped_outs = [{unwrap_fn}(o) for o in unwrapped_outs]")
 
     # --- Output wrapping ---
     result_exprs, _ = _emit_output_wrapping(state, out_metas, num_fw_outs_saved_for_bw)
@@ -617,6 +620,8 @@ def codegen_subclass_wrapper(
     num_fw_outs_saved_for_bw: int | None,
     frozen_inp_indices: frozenset[int] = frozenset(),
     act_input_paths: ActInputPaths | None = None,
+    *,
+    has_opaque_outputs: bool = False,
 ) -> Callable[..., object]:
     """Generate a specialized wrapper function for subclass unwrap/wrap."""
     source, globals_dict = _codegen_subclass_wrapper_source(
@@ -625,6 +630,7 @@ def codegen_subclass_wrapper(
         num_fw_outs_saved_for_bw,
         frozen_inp_indices,
         act_input_paths=act_input_paths,
+        has_opaque_outputs=has_opaque_outputs,
     )
     globals_dict["compiled_fn"] = compiled_fn
     return _compile_and_exec_source(
