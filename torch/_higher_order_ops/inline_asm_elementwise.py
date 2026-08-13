@@ -37,15 +37,19 @@ class InlineAsmElementwiseOp(HigherOrderOperator):
         constraints: Inline-asm constraints in LLVM format. Output constraints
             are prefixed with ``=`` (e.g. ``"=f,f,f"`` for one float output
             and two float inputs).
-        dtype: Element type of the returned tensor.
+        dtype: Element type of the returned tensor, or a tuple of element types
+            for multiple output tensors. Multiple outputs require
+            ``torch.compile``.
         is_pure: Must be ``True``. If true, the compiler may assume the asm
             block has no side-effects.
         pack: Number of elements processed per asm invocation.  When
             ``pack > 1``, the constraint string must list ``pack`` outputs
-            and ``pack`` copies of each input.  Requires ``torch.compile``.
+            per returned tensor and ``pack`` copies of each input. Requires
+            ``torch.compile``.
 
     Returns:
-        A tensor with the broadcast shape of the inputs and the given dtype.
+        A tensor, or tuple of tensors, with the broadcast shape of the inputs
+        and the given dtype or dtypes.
 
     Example::
 
@@ -67,6 +71,14 @@ class InlineAsmElementwiseOp(HigherOrderOperator):
         ...     dtype=torch.float32,
         ...     pack=2,
         ... )
+
+        >>> # xdoctest: +SKIP(requires CUDA and torch.compile)
+        >>> first, second = inline_asm_elementwise(
+        ...     x,
+        ...     asm_str="mov.b32 $0, $2; add.s32 $1, $2, 1;",
+        ...     constraints="=r,=r,r",
+        ...     dtype=(torch.int32, torch.int32),
+        ... )
     """
 
     def __init__(self):
@@ -77,12 +89,14 @@ class InlineAsmElementwiseOp(HigherOrderOperator):
         *inputs: torch.Tensor,
         asm_str: str,
         constraints: str,
-        dtype: torch.dtype,
+        dtype: torch.dtype | tuple[torch.dtype, ...],
         is_pure: bool = True,
         pack: int = 1,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         if not is_pure:
             raise ValueError("inline_asm_elementwise only supports is_pure=True")
+        if isinstance(dtype, tuple) and not dtype:
+            raise ValueError("inline_asm_elementwise requires at least one output")
         # pyrefly: ignore [missing-attribute]
         return super().__call__(
             *inputs,
@@ -185,9 +199,9 @@ def _inline_asm_dense(*inputs, asm_str, constraints, dtype, is_pure, pack):
     if not inputs[0].is_cuda:
         raise RuntimeError("inline_asm_elementwise only supports CUDA tensors")
 
-    if pack > 1:
+    if pack > 1 or isinstance(dtype, tuple):
         raise RuntimeError(
-            "inline_asm_elementwise with pack > 1 requires torch.compile"
+            "inline_asm_elementwise requires torch.compile for pack > 1 or multiple outputs"
         )
 
     n_outputs, n_inputs = _parse_constraints(constraints)
@@ -250,6 +264,8 @@ def _elementwise_output_like(*inputs, dtype):
 
 @register_fake(inline_asm_elementwise, skip_cache=True)
 def _(*inputs, asm_str, constraints, dtype, is_pure=True, pack=1):
+    if isinstance(dtype, tuple):
+        return tuple(_elementwise_output_like(*inputs, dtype=dt) for dt in dtype)
     return _elementwise_output_like(*inputs, dtype=dtype)
 
 
