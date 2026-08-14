@@ -283,6 +283,39 @@ if [[ "$BUILD_ENVIRONMENT" != *libtorch* ]]; then
   fi
   pip_install_whl "$(echo dist/*.whl)"
 
+  # native-AOT stage 2: export DSL kernels, relink torch_cuda with them
+  # embedded, and patch the relinked library back into the wheel handed
+  # to test jobs. Needs the INSTALLED torch (kernel builders import it),
+  # which is why it runs post-install rather than inside the PEP 517
+  # build. Skips cleanly (printing why) with TORCH_NATIVE_AOT=0, on a
+  # non-CUDA build, when no toolchain targets this backend, or when no
+  # supported arch is targeted. Past those checks the DSL runtimes are
+  # required and any failure fails the build. See
+  # tools/native_aot/build_stage2.py.
+  #
+  # The DSL wheels are installed HERE rather than in
+  # .ci/docker/requirements-ci.txt: that file is shared by every image, so
+  # pinning them there put ~190 MB of CUDA-only tooling into the CPU, ROCm
+  # and XPU images -- and made capability probes lie there (a ROCm image
+  # with the wheel reports CUTLASS available, then fails cuInit).
+  # ONE owner of the decision: stage 2 prints its own verdict and we install
+  # only when it says RUN. An independent `python -c` probe here used to decide
+  # by exit code, which disagrees with stage 2's stdout-based probe on GPU-less
+  # CUDA builders -- a CUDA torch can segfault in interpreter teardown there
+  # (seen on the b200 build job), so the exit code said "not CUDA", the install
+  # was skipped, and stage 2 then failed the build demanding the runtimes.
+  if [[ "$(python tools/native_aot/build_stage2.py --print-verdict)" == "RUN" ]]; then
+    install_cutlass_dsl
+  fi
+  # One wheel expected; a stale second one in dist/ would otherwise be glued
+  # into a single argument containing a space.
+  naot_wheels=(dist/*.whl)
+  if [[ ${#naot_wheels[@]} -ne 1 ]]; then
+    echo "native-AOT: expected exactly one wheel in dist/, found ${#naot_wheels[@]}" >&2
+    exit 1
+  fi
+  python tools/native_aot/build_stage2.py --wheel "${naot_wheels[0]}"
+
   # Smoke-test tools/build_with_debinfo.py against the real build tree: it must
   # still emit a debug-rebuild plan with a -g compile and the libtorch_python
   # relink. This guards against build-system changes (e.g. a new
