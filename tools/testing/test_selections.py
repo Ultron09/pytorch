@@ -14,12 +14,12 @@ from tools.testing.test_run import ShardedTest, TestRun
 try:
     import torch
     from torch.testing._internal.common_cuda import SM80OrLater
-    from torch.testing._internal.common_utils import TEST_CUDA
+    from torch.testing._internal.common_utils import IS_WINDOWS, TEST_CUDA
 except ImportError:
     torch = None
     TEST_CUDA = False
     SM80OrLater = False
-
+    IS_WINDOWS = os.name == "nt"
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -46,7 +46,7 @@ THRESHOLD = 60 * 10  # 10 minutes
 
 # See Note [ROCm parallel CI testing]
 # Special logic for ROCm GHA runners to query number of GPUs available.
-if IS_ROCM and not IS_MEM_LEAK_CHECK:
+if IS_ROCM and not IS_MEM_LEAK_CHECK and not IS_WINDOWS:
     try:
         # This is the same logic used in GHA health check, see .github/templates/common.yml.j2
         lines = (
