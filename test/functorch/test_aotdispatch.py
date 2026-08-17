@@ -246,6 +246,16 @@ class AOTTestCase(TestCase):
                     self.assertTensorMetadataEqual(actual_inner, expected_inner)
 
 
+@torch.fx.wrap
+def _il_log_tensor_stats_for_regression(t, name):
+    # Directly exercise the unbacked-symbol allocation path: `.item()` on a
+    # fake tensor allocates a fresh unbacked SymInt. Bare (no if/bool, no
+    # try/except) so an unrelated swallowed exception can't turn the
+    # regression into a no-op.
+    torch.all(torch.isfinite(t)).item()
+    return t
+
+
 class TestPythonKey(AOTTestCase):
     def test_make_fx(self, device):
         def f(x):
@@ -4920,6 +4930,63 @@ def forward(self, tangents_1):
                     y.sum().backward()
             except torch._dynamo.exc.BackendCompilerFailed as e:
                 raise e.inner_exception from e
+
+    @torch._functorch.config.patch(saved_tensors_hooks_filtering_mode="no_static")
+    def test_saved_tensors_hooks_gm_data_dependent_probe(self):
+        # Regression: pack GraphModule bodies that allocate a fresh unbacked
+        # SymInt (e.g. via `.item()` / `bool(<fake_tensor>)` / nonzero) used
+        # to leak into `pending_fresh_unbacked_symbols` because
+        # `maybe_inline_graph_saved_tensors_hooks` ran the hook without a
+        # ProxyTorchDispatchMode, leaving no tracker to bind the symbol.
+        #
+        # The list / dict variants additionally cover container-typed pack
+        # outputs: `pack_out_val` is extracted from the traced graph's output
+        # node args (immutable_list / immutable_dict) and must be normalized
+        # back to plain list / dict so the unpack hook traces against the same
+        # runtime container type it would see in eager.
+
+        def fn(x, w):
+            return torch.matmul(x, w).sin()
+
+        def _run(pack, unpack):
+            pack_gm, unpack_gm = saved_tensors_hooks_to_gm(
+                pack, unpack, "pack_hash", "unpack_hash"
+            )
+            x = torch.randn(8, 16, requires_grad=True)
+            w = torch.randn(16, 16, requires_grad=True)
+            compiled = torch.compile(fn, backend="aot_eager", fullgraph=True)
+            with torch.autograd.graph.saved_tensors_hooks(pack_gm, unpack_gm):
+                out = compiled(x, w)
+                out.sum().backward()
+
+        # single-tensor pack output
+        def pack_tensor(x):
+            x = _il_log_tensor_stats_for_regression(x, "in")
+            return _il_log_tensor_stats_for_regression(x, "out")
+
+        def unpack_tensor(x):
+            return x
+
+        _run(pack_tensor, unpack_tensor)
+
+        # list-typed pack output — exercises immutable_list normalization
+        def pack_list(x):
+            return [_il_log_tensor_stats_for_regression(x, "in")]
+
+        def unpack_list(packed):
+            (x,) = packed
+            return x
+
+        _run(pack_list, unpack_list)
+
+        # dict-typed pack output — exercises immutable_dict normalization
+        def pack_dict(x):
+            return {"t": _il_log_tensor_stats_for_regression(x, "in")}
+
+        def unpack_dict(packed):
+            return packed["t"]
+
+        _run(pack_dict, unpack_dict)
 
     def test_mark_activations_dynamic_with_nested(self):
         # The flattened tensors of the nested tensor aren't

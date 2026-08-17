@@ -44,6 +44,7 @@ from torch.fx.experimental._backward_state import BackwardState
 from torch.fx.experimental.proxy_tensor import is_sym_node
 from torch.fx.experimental.symbolic_shapes import fx_placeholder_vals, guard_or_true
 from torch.fx.graph_module import GraphModule
+from torch.fx.immutable_collections import immutable_dict, immutable_list
 from torch.fx.passes._tensorify_python_scalars import tensorify_python_scalars
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.types import py_sym_types
@@ -1508,7 +1509,49 @@ def maybe_inline_graph_saved_tensors_hooks(
             return {"_fw_graph": fw_g, "_bw_graph": bw_g, "_node": saved}
 
         with _saved_tensor_hook_context(_get_extra_info()):
-            pack_out_val = pack_hook_gm(val)
+            pack_gm = prepare_hook_gm(aot_config, pack_hook_gm, (val,))
+            pack_g = pack_gm.graph
+            maybe_log_graph(
+                pack_gm,
+                f"saved_tensors_pack_hook {saved.name}",  # type: ignore[union-attr]
+                aot_config,
+                lambda: f"aot_saved_tensors_hooks_pack {saved.name}",  # type: ignore[union-attr]
+                structured_logs,
+            )
+
+            # Extract pack_out_val from the traced graph's output-node meta.
+            # `pack_g` is what gets inlined into the joint graph below via
+            # `node_copy`, so its output meta uses the same symbols the
+            # inlined nodes carry — no identity mismatch, no need to re-run
+            # the hook to get an "example value".
+            #
+            # FX stores the output node's container args as immutable_list /
+            # immutable_dict. Executing the hook (the old code path) instead
+            # returned plain list / dict. `pack_out_val` feeds the unpack hook
+            # trace below (`prepare_hook_gm(unpack_hook_gm, (pack_out_val,))`),
+            # so normalize the containers back to their runtime types to keep
+            # the unpack trace in parity with eager and avoid tracing a
+            # different backward for container-type-sensitive unpack hooks.
+            def _materialize_fx_output_containers(x: Any) -> Any:
+                if type(x) in (immutable_list, list):
+                    return [_materialize_fx_output_containers(v) for v in x]
+                if type(x) in (immutable_dict, dict):
+                    return {
+                        k: _materialize_fx_output_containers(v) for k, v in x.items()
+                    }
+                if isinstance(x, tuple):
+                    values = tuple(_materialize_fx_output_containers(v) for v in x)
+                    return type(x)(*values) if hasattr(x, "_fields") else values
+                return x
+
+            pack_out_args = _materialize_fx_output_containers(
+                pack_g.output_node().args[0]
+            )
+            pack_out_val = pytree.tree_map_only(
+                torch.fx.Node,
+                lambda n: n.meta["val"],
+                pack_out_args,
+            )
 
         requires_sc_handling = any(
             is_traceable_wrapper_subclass(x) for x in pytree.tree_leaves(pack_out_val)
@@ -1519,18 +1562,6 @@ def maybe_inline_graph_saved_tensors_hooks(
                 "You can workaround it by manually returning subclass's inner tensors"
                 " in the pack hook, and reconstructing the subclass in the unpack hook"
             )
-
-        with _saved_tensor_hook_context(_get_extra_info()):
-            pack_gm = prepare_hook_gm(aot_config, pack_hook_gm, (val,))
-            pack_g = pack_gm.graph
-            maybe_log_graph(
-                pack_gm,
-                f"saved_tensors_pack_hook {saved.name}",  # type: ignore[union-attr]
-                aot_config,
-                lambda: f"aot_saved_tensors_hooks_pack {saved.name}",  # type: ignore[union-attr]
-                structured_logs,
-            )
-            pack_out_val = pack_gm(val)
 
         # Install pack hook graph as eiplogue of fw_module.
         # Saved tensor output becomes input of pack hook graph.
