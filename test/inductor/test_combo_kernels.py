@@ -355,6 +355,60 @@ class ComboKernelTests(TestCase):
         self.assertEqual(out_eager, out_compiled)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
 
+    @requires_cuda_and_triton
+    def test_source_independent_masks_stay_local(self):
+        def make_mask(size, dtype, value):
+            index = torch.arange(size, device=GPU_TYPE)
+            causal = index[:, None] >= index[None, :]
+            return torch.where(causal, value, float("-inf")).to(dtype)
+
+        def fn(q, k, v):
+            size = q.shape[-2]
+            first = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=make_mask(size, q.dtype, 0.0)
+            )
+            second = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=make_mask(size, q.dtype, 1.0)
+            )
+            return first + second
+
+        inps = [
+            torch.rand(1, 4, 128, 32, device=GPU_TYPE, dtype=torch.float16)
+            for _ in range(3)
+        ]
+        with fresh_cache():
+            _, code = run_and_get_code(torch.compile(fn), *inps)
+
+        source = "\n".join(code)
+        aoti_sdpa = "AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_cuda__scaled_dot_product_"
+        events = []
+        for line in source.splitlines():
+            line = line.lstrip()
+            if " = torch.ops.aten._scaled_dot_product_" in line or line.startswith(
+                aoti_sdpa
+            ):
+                events.append("attention")
+            elif ".run(" in line or line.startswith("call_triton_"):
+                events.append("kernel")
+        self.assertEqual(events[:4], ["kernel", "attention", "kernel", "attention"])
+        self.assertNotIn("'num_kernels': 2", source)
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 3)
+
+    @requires_gpu_and_triton
+    @torch._functorch.config.patch("cse", False)
+    def test_source_independent_wheres_without_sdpa_remain_combinable(self):
+        def make_mask(size):
+            index = torch.arange(size, device=GPU_TYPE)
+            return torch.where(index[:, None] >= index[None, :], 0.0, float("-inf"))
+
+        def fn():
+            return make_mask(64), make_mask(128)
+
+        _, code = run_and_get_code(torch.compile(fn))
+
+        self.assertIn("'num_kernels': 2", "\n".join(code))
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
+
     @requires_gpu_and_triton
     def test_reduce_functions(self):
         def test_reduce(a, b, c, d):
