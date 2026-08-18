@@ -552,6 +552,29 @@ class ReconstructTest(torch._dynamo.test_case.TestCase):
         self.assertEqual(len(backend.graphs), 1)
         self.assertEqual(ref, res)
 
+    def test_tma_stable_cpu_subclass_reconstruct(self):
+        try:
+            from triton.backends.cpu.tensor_descriptor import (
+                TensorDescriptor as CPUTensorDescriptor,
+            )
+        except ImportError:
+            self.skipTest("requires Triton CPU TensorDescriptor support")
+
+        def create_tma(tensor):
+            descriptor = CPUTensorDescriptor.from_tensor(tensor, [16])
+            return tensor + 1, descriptor
+
+        x = torch.randn(16)
+        backend = torch._dynamo.testing.EagerAndRecordGraphs()
+        result, descriptor = torch.compile(
+            create_tma, backend=backend, fullgraph=True
+        )(x)
+
+        self.assertEqual(len(backend.graphs), 1)
+        self.assertEqual(result, x + 1)
+        self.assertIsInstance(descriptor, CPUTensorDescriptor)
+        self.assertEqual(descriptor.block_shape, [16])
+
     def test_self_referential_sourceful(self):
         l = []
         l.append((0, l))

@@ -1121,6 +1121,17 @@ class VariableBuilder:
             if hasattr(triton_mod, "set_allocator"):
                 set_allocator = triton_mod.set_allocator
 
+        def get_tensor_descriptor_class(factory: Any) -> type[Any] | None:
+            module = sys.modules.get(getattr(factory, "__module__", ""))
+            descriptor_class = getattr(module, "TensorDescriptor", None)
+            if (
+                inspect.isclass(descriptor_class)
+                and issubclass(descriptor_class, TensorDescriptor)
+                and descriptor_class.from_tensor is factory
+            ):
+                return descriptor_class
+            return None
+
         # Handle exact type() match
         type_dispatch = self._type_dispatch().get(type(value))
         if type_dispatch is not None:
@@ -1789,6 +1800,11 @@ class VariableBuilder:
             return CreateTMADescriptorExperimentalVariable(rank=2)
         elif value is TensorDescriptor.from_tensor:
             return CreateTMADescriptorStableVariable()
+        elif descriptor_class := get_tensor_descriptor_class(value):
+            return CreateTMADescriptorStableVariable(
+                descriptor_module=descriptor_class.__module__,
+                descriptor_class=descriptor_class.__name__,
+            )
         elif value is set_allocator:
             return TritonSetAllocatorVariable(value)
         elif isinstance(value, torch.amp.autocast_mode.autocast):

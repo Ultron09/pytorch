@@ -3716,6 +3716,8 @@ class TMADescriptorStableVariable(VariableTracker):
         self,
         tensor: "TensorVariable",
         block_shape: "ListVariable",
+        descriptor_module: str = "triton.tools.tensor_descriptor",
+        descriptor_class: str = "TensorDescriptor",
         **kwargs: Any,
     ) -> None:
         if not tensor.is_tensor():
@@ -3723,6 +3725,8 @@ class TMADescriptorStableVariable(VariableTracker):
         super().__init__(**kwargs)
         self.tensor = tensor
         self.block_shape = block_shape
+        self.descriptor_module = descriptor_module
+        self.descriptor_class = descriptor_class
 
     def to_metadata(self) -> Any:
         return create_tma_stable_metadata(
@@ -3731,8 +3735,8 @@ class TMADescriptorStableVariable(VariableTracker):
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen.load_import_from(
-            "triton.tools.tensor_descriptor",
-            "TensorDescriptor",
+            self.descriptor_module,
+            self.descriptor_class,
         )
         codegen.load_method("from_tensor")
         codegen(self.tensor)
@@ -3820,6 +3824,16 @@ class CreateTMADescriptorExperimentalVariable(VariableTracker):
 
 
 class CreateTMADescriptorStableVariable(VariableTracker):
+    def __init__(
+        self,
+        descriptor_module: str = "triton.tools.tensor_descriptor",
+        descriptor_class: str = "TensorDescriptor",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.descriptor_module = descriptor_module
+        self.descriptor_class = descriptor_class
+
     def python_type(self) -> type:
         return types.FunctionType
 
@@ -3835,6 +3849,8 @@ class CreateTMADescriptorStableVariable(VariableTracker):
         return TMADescriptorStableVariable(
             tensor=tensor,  # type: ignore[arg-type]
             block_shape=block_shape,  # type: ignore[arg-type]
+            descriptor_module=self.descriptor_module,
+            descriptor_class=self.descriptor_class,
         )
 
 
