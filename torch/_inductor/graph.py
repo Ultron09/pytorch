@@ -1611,6 +1611,8 @@ class GraphLowering(torch.fx.Interpreter):
             self.constant_reprs[target] = ""
             return TorchBindObject(name=target, value=value)
         elif is_custom_class(type(value)):
+            # TODO: widen torchbind_constants type to include plain opaque objects
+            # so this type: ignore can be removed (see CompiledFxGraph).
             self.torchbind_constants[target] = value  # type: ignore[arg-type]
             self.constant_reprs[target] = ""
             return TorchBindObject(name=target, value=value)  # type: ignore[arg-type]

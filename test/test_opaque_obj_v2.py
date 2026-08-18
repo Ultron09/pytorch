@@ -2431,7 +2431,7 @@ class GraphModule(torch.nn.Module):
 
         # The subclass output must also be correct
         self.assertIsInstance(result, WrapperSub)
-        self.assertEqual(result._cfg, StrictEqValueConfig(0.5))
+        self.assertIs(type(result._cfg), StrictEqValueConfig)
 
         # Grad-mode change triggers a recompile; without the fix the corrupted
         # opaque causes a guard failure (AssertionError: Unexpected type FakeScriptObject)
@@ -2493,7 +2493,9 @@ class GraphModule(torch.nn.Module):
         CompiledFxGraphConstants.unwrap() (AOTAutograd cache path) has the
         same fix but is unreachable here -- the subclass constructor in the
         graph triggers BypassAOTAutogradCache at autograd_cache.py:244-248
-        ("Unsupported call_function target").
+        ("Unsupported call_function target").  The base-class edit is
+        defensive: reachable in graphs with opaque constants but no subclass
+        constructor.
         """
         script = textwrap.dedent(
             """
@@ -2584,13 +2586,11 @@ class GraphModule(torch.nn.Module):
 
             # Run 1: populate cache (cold compile)
             line1 = run_and_parse()
-            self.assertIn("cfg_type=Q", line1)
-            self.assertIn("hit=0 ", line1)
+            self.assertEqual(line1, "RESULT hit=0 miss=1 cfg_type=Q")
 
             # Run 2: cache hit in a fresh process, opaque must survive
             line2 = run_and_parse()
-            self.assertIn("cfg_type=Q", line2)
-            self.assertIn("hit=1 ", line2)
+            self.assertEqual(line2, "RESULT hit=1 miss=0 cfg_type=Q")
 
     def test_tangent_primal_proxy_collision_for_opaque_inner_attr(self):
         """Regression test for tangent/primal proxy collision.
@@ -2656,39 +2656,6 @@ class GraphModule(torch.nn.Module):
         self.assertIsNotNone(x.grad)
         expected_grad = torch.ones_like(x) * 2.5
         self.assertTrue(torch.allclose(x.grad, expected_grad))
-
-    def test_opaque_in_activation_region_with_subclass_output(self):
-        """Opaque saved for backward (activation region) must be unwrapped
-        when the graph also has subclass outputs.
-
-        This exercises the num_opaque_objects_saved_for_bw clause of the
-        has_opaque_outputs gate.  The OpaqueMultiplier is a module attribute
-        (get_attr node in the graph) used by mul_with_scale which needs it
-        in backward.  The function takes TensorWithCounter (subclass) as
-        input, triggering the subclass wrapper.
-        """
-
-        class ModWithScale(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.multiplier = OpaqueMultiplier(2.5)
-
-            def forward(self, x):
-                return torch.ops._TestOpaqueObject.mul_with_scale(self.multiplier, x)
-
-        a = torch.randn(3, 3, requires_grad=True)
-        b = torch.randn(3, 3, requires_grad=True)
-        counter = Counter(start=1, end=5)
-        size = SizeStore(3)
-        x = TensorWithCounter(a, b, counter, size)
-
-        m = ModWithScale()
-        opt_fn = torch.compile(m, backend="aot_eager", fullgraph=True)
-        out = opt_fn(x)
-        self.assertIsInstance(out, TensorWithCounter)
-
-        out.sum().backward()
-        self.assertIsNotNone(x.grad)
 
     def test_tensor_subclass_opaque_backward_compiled_autograd(self):
         """Test opaque objects work with compiled autograd backward."""

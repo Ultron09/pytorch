@@ -1461,12 +1461,14 @@ class AOTDispatchSubclassWrapper(CompilerWrapper):
         #   by is_custom_class) and symbolic opaques passed through from inputs
         #   (raw_type = FakeScriptObject).  Mutated inputs and intermediate
         #   bases cannot be opaques, so output_info covers all of flat_f_outs.
-        # - num_opaque_objects_saved_for_bw: opaques in the trailing activation
-        #   region (saved for backward), disjoint from output_info.  Opaques
-        #   are fakeified by frontend_utils.py:105-108 during AOT tracing, so
-        #   they may be FakeScriptObject in the compiled graph output.  In
-        #   observed cases these are symbolic passthrough from subclass inputs
-        #   (real at runtime), but the clause covers the general case.
+        # - num_opaque_objects_saved_for_bw: covers the trailing activation
+        #   region (saved for backward), which output_info does not reach.
+        #   Incremented for placeholder or call_function nodes whose
+        #   meta["val"] is FakeScriptObject or CustomClassBase
+        #   (graph_compile.py is_opaque_node / isinstance check).  The unwrap
+        #   is a no-op on real objects (just a type check) so the clause is
+        #   cheap and ensures correctness if the compiled forward ever returns
+        #   a FakeScriptObject in this region.
         # Note: is_custom_class also fires for enum outputs (Enum is registered
         # at opaque_object.py); the unwrap is a no-op for those.
         has_opaque_outputs = (

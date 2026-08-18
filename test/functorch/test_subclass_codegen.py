@@ -4,15 +4,29 @@ import logging
 import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import torch
 import torch._functorch.config
-from torch._functorch._aot_autograd.schemas import OpaqueMeta, PlainTensorMeta
+from torch._functorch._aot_autograd.schemas import (
+    OpaqueMeta,
+    OutputAliasInfo,
+    OutputType,
+    PlainTensorMeta,
+)
 from torch._functorch._aot_autograd.subclass_codegen import (
     _codegen_subclass_wrapper_source,
 )
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch._library.fake_class_registry import FakeScriptObject, maybe_to_fake_obj
+from torch._library.opaque_object import (
+    _OPAQUE_TYPES_BY_NAME,
+    get_opaque_type_name,
+    register_custom_class,
+)
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, TestCase
 from torch.testing._internal.two_tensor import TwoTensor
 
 
@@ -35,7 +49,11 @@ class _TestSubclassMeta:
 
 
 class _TensorWithOpaque(torch.Tensor):
-    """Synthetic subclass for golden tests involving OpaqueMeta attrs."""
+    """Codegen-only stub for golden tests involving OpaqueMeta attrs.
+
+    Not executable (no __tensor_unflatten__); these tests verify generated
+    source code, not runtime behavior.
+    """
 
 
 class TestSubclassCodegen(TestCase):
@@ -666,6 +684,117 @@ def inner_fn(args):
         self.assertIsInstance(out[0], TwoTensor)
         self.assertEqual(out[0].a, a * 2)
         self.assertEqual(out[0].b, b * 2)
+
+    @skipIfTorchDynamo("unit test manipulates FakeScriptObject directly")
+    def test_activation_unwrap_with_fake_script_object(self):
+        """The has_opaque_outputs gate in AOTDispatchSubclassWrapper.post_compile
+        includes `(runtime_metadata.num_opaque_objects_saved_for_bw or 0) > 0`.
+        This test proves that clause is load-bearing: when output_info has no
+        opaques but a FakeScriptObject is in the saved-for-backward activation
+        region, the clause fires and the unwrap recovers the real object.
+
+        The counter increments for placeholder or call_function nodes whose
+        meta["val"] is FakeScriptObject/CustomClassBase.  We call post_compile
+        directly with a simulated compiled_fn that returns FakeScriptObject in
+        the activation slot, since no end-to-end compilation path has been
+        found that produces this at runtime.
+        """
+
+        class _Cfg:
+            def __init__(self, v):
+                self.v = v
+
+            def __obj_flatten__(self):
+                return [], {"v": self.v}
+
+            @classmethod
+            def __obj_unflatten__(cls, f, s):
+                return cls(**s)
+
+            def __eq__(self, o):
+                return type(o) is _Cfg and o.v == self.v
+
+            def __hash__(self):
+                return hash(self.v)
+
+            def __fx_repr__(self):
+                return f"_Cfg(v={self.v!r})", {"_Cfg": _Cfg}
+
+        register_custom_class(_Cfg, typ="constant")
+
+        try:
+            # Local import: module-level causes circular dependency
+            # through torch._dynamo.compiled_autograd.
+            from torch._functorch._aot_autograd.runtime_wrappers import (
+                AOTDispatchSubclassWrapper,
+            )
+
+            fake_mode = FakeTensorMode()
+            real_cfg = _Cfg(7.0)
+            fake_cfg = maybe_to_fake_obj(fake_mode, real_cfg)
+
+            # compiled_fn returns [tensor_out, FakeScriptObject_activation]
+            def compiled_fn(args):
+                return [args[0] * 2, fake_cfg]
+
+            # output_info has no opaques (only a plain tensor)
+            output_info = [
+                OutputAliasInfo(
+                    output_type=OutputType.non_alias,
+                    raw_type=torch.Tensor,
+                    base_idx=None,
+                    dynamic_dims=set(),
+                    requires_grad=False,
+                    requires_grad_for_backward=False,
+                )
+            ]
+            runtime_metadata = SimpleNamespace(
+                output_info=output_info,
+                num_opaque_objects_saved_for_bw=1,
+                subclass_inp_meta=[PlainTensorMeta(unwrapped_idx=0)],
+                subclass_fw_graph_out_meta=[PlainTensorMeta(unwrapped_idx=0)],
+                act_input_paths=None,
+            )
+
+            wrapper_obj = AOTDispatchSubclassWrapper(
+                trace_joint=True,
+                fw_only=None,
+                maybe_subclass_meta=SimpleNamespace(),  # non-None to pass early return
+                num_fw_outs_saved_for_bw=1,
+            )
+
+            # With num_opaque=1: clause fires, unwrap emitted
+            with patch.object(
+                AOTDispatchSubclassWrapper,
+                "_get_frozen_inp_indices",
+                return_value=frozenset(),
+            ):
+                inner_fn = wrapper_obj.post_compile(
+                    compiled_fn, None, runtime_metadata=runtime_metadata
+                )
+            inner_fn._boxed_call = True
+            x = torch.randn(4, 4)
+            result = inner_fn([x])
+            self.assertIsInstance(result[0], torch.Tensor)
+            self.assertIs(result[1], real_cfg)
+
+            # With num_opaque=0: clause doesn't fire, stays FakeScriptObject
+            runtime_metadata.num_opaque_objects_saved_for_bw = 0
+            with patch.object(
+                AOTDispatchSubclassWrapper,
+                "_get_frozen_inp_indices",
+                return_value=frozenset(),
+            ):
+                inner_fn_no = wrapper_obj.post_compile(
+                    compiled_fn, None, runtime_metadata=runtime_metadata
+                )
+            inner_fn_no._boxed_call = True
+            result_no = inner_fn_no([x])
+            self.assertIsInstance(result_no[1], FakeScriptObject)
+        finally:
+            name = get_opaque_type_name(_Cfg)
+            torch._C._unregister_opaque_type(name)
+            _OPAQUE_TYPES_BY_NAME.pop(name, None)
 
 
 if __name__ == "__main__":
