@@ -33,8 +33,9 @@ PERF_SLOWDOWN_TOLERANCE = 1.05  # 5% tolerance on performance
 # Use torch.cuda.get_device_properties() to query actual device capabilities.
 
 IS_ROCM = torch.version.hip is not None
-skipIfRocm714 = unittest.skipIf(
-    getRocmVersion() == (7, 14), "ROCm version 7.14: known failure"
+# Preview wheels report torch.version.rocm as 10.1.x (HIP remains 7.15.x).
+skipIfRocm101 = unittest.skipIf(
+    getRocmVersion() == (10, 1), "ROCm version 10.1: known failure"
 )
 
 try:
@@ -181,8 +182,8 @@ class TestOrigami(TestCase):
             "triton.native_matmul": False,
         }
 
-    # TODO(AIPYTORCH-1024): Re-enable after resolving the ROCm 7.14 SIGSEGV.
-    @skipIfRocm714
+    # TODO(AIPYTORCH-1024): Re-enable after resolving the ROCm 10.1 SIGSEGV.
+    @skipIfRocm101
     def test_origami_respects_gemm_search_space(self):
         for op_name in ("mm", "addmm", "bmm"):
             with self.subTest(op_name=op_name, search_space="DEFAULT"):
@@ -201,8 +202,8 @@ class TestOrigami(TestCase):
                 )
                 self.assertEqual(exhaustive_case["topk_calls"], 0)
 
-    # TODO(AIPYTORCH-1024): Re-enable after resolving the ROCm 7.14 SIGSEGV.
-    @skipIfRocm714
+    # TODO(AIPYTORCH-1024): Re-enable after resolving the ROCm 10.1 SIGSEGV.
+    @skipIfRocm101
     def test_origami_reduces_compile_work_vs_regular_max_autotune(self):
         """Test that origami reduces compile work (GPU benchmarking calls) vs regular max_autotune.
 
@@ -294,8 +295,8 @@ class TestOrigami(TestCase):
                             max_autotune_runtime_ms * PERF_SLOWDOWN_TOLERANCE,
                         )
 
-    # TODO(AIPYTORCH-1024): Re-enable after resolving the ROCm 7.14 SIGSEGV.
-    @skipIfRocm714
+    # TODO(AIPYTORCH-1024): Re-enable after resolving the ROCm 10.1 SIGSEGV.
+    @skipIfRocm101
     def test_origami_topk_edge_cases(self):
         """Test edge cases for origami_topk parameter.
 
