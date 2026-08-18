@@ -1226,6 +1226,24 @@ class SubclassTests(_SubclassCompileCheckMixin, torch._dynamo.test_case.TestCase
         self.assertEqual(res_exp, res_act)
         self.assertEqual(x0, x1)
 
+    # https://github.com/pytorch/pytorch/issues/193932
+    @torch._functorch.config.patch(check_custom_op_aliasing=True)
+    def test_bare_subclass_matmul(self):
+        # matmul lowers to an extern kernel, so the compiled code re-enters
+        # dispatch with the subclass input still wrapped.
+        class Bare(torch.Tensor):
+            pass
+
+        def fn(t):
+            return t @ t.t()
+
+        x = torch.randn(4, 4)
+        res_exp = fn(x.as_subclass(Bare))
+        opt_fn = torch.compile(fn, backend="inductor", fullgraph=True)
+        res_act = opt_fn(x.as_subclass(Bare))
+        self.assertEqual(res_exp, res_act)
+        self.assertIsInstance(res_act, Bare)
+
     # ACT (AsyncCollectiveTensor) can be constructed directly, so the guard
     # relaxation for ACT inputs is exercised here on CPU without a process group.
     # The end-to-end path with a real collective + inductor is covered by
