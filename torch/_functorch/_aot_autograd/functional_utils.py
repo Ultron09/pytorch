@@ -9,7 +9,7 @@ This file contains utilities related to functionalization in AOTAutograd:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, TypeGuard
+from typing import Any, TYPE_CHECKING, TypeGuard
 
 import torch
 from torch import Tensor
@@ -25,6 +25,10 @@ from torch.utils._python_dispatch import (
     is_traceable_wrapper_subclass,
     transform_subclass,
 )
+
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 aot_joint_log = getArtifactLogger(__name__, "aot_joint_graph")
@@ -312,6 +316,33 @@ def has_metadata_mutation(
         return has_metadata_mutation_
 
 
+def _patch_requires_grad(
+    aliased_base_tensor: Tensor, out: Tensor, target_requires_grad: bool
+) -> Tensor:
+    if aliased_base_tensor.requires_grad and not target_requires_grad:
+        out = out.detach()
+    elif not aliased_base_tensor.requires_grad and target_requires_grad:
+        out.requires_grad_(True)
+    return out
+
+
+def _reshape_base_for_view_replay(
+    aliased_base_tensor: Tensor, target_meta_tensor: Tensor
+) -> Tensor | None:
+    if target_meta_tensor._base is None:
+        return None
+    target_base = target_meta_tensor._base
+    if aliased_base_tensor is not target_base and (
+        aliased_base_tensor.size() != target_base.size()
+        or aliased_base_tensor.stride() != target_base.stride()
+        or aliased_base_tensor.storage_offset() != target_base.storage_offset()
+    ):
+        return aliased_base_tensor.as_strided(
+            target_base.size(), target_base.stride(), target_base.storage_offset()
+        )
+    return aliased_base_tensor
+
+
 def gen_alias_from_base(
     aliased_base_tensor: Tensor,
     target_meta_tensor: Tensor,
@@ -320,16 +351,6 @@ def gen_alias_from_base(
     *,
     replay_views: bool,
 ) -> Tensor:
-    # Patch the correct requires_grad field of the output tensor, depending on whether:
-    # (i) the reconstructed output (out) was came from a tensor that requires grad or not;
-    # and (ii) the concrete returned output does require grad or not.
-    def patch_requires_grad(out: Tensor) -> Tensor:
-        if aliased_base_tensor.requires_grad and not target_requires_grad:
-            out = out.detach()
-        elif not aliased_base_tensor.requires_grad and target_requires_grad:
-            out.requires_grad_(True)
-        return out
-
     # If provided, use the target functional tensor for replaying the views.
     #
     # In summary, we use the fact that FunctionalTensorWrapper saves the view
@@ -351,26 +372,14 @@ def gen_alias_from_base(
                 "incorrect out shape after application of ViewMeta sequence: "
                 f"{tuple(out.shape)} (actual) vs {tuple(target_meta_tensor.shape)} (expected)"
             )
-        return patch_requires_grad(out)
+        return _patch_requires_grad(aliased_base_tensor, out, target_requires_grad)
 
     # Try to do view-replay if possible.
     # fall back to .as_strided() if we can't.
-    if target_meta_tensor._base is not None:
-        # The base that we want to replay our view off of might have a different shape than the view's original base.
-        b = target_meta_tensor._base
-        abt = aliased_base_tensor
-        # Don't unnecessarily call as_strided if nothing changed; as_strided's
-        # backward is poorly implemented and slow
-        if abt is not b and (
-            abt.size() != b.size()
-            or abt.stride() != b.stride()
-            or abt.storage_offset() != b.storage_offset()
-        ):
-            reshaped_base_tensor = aliased_base_tensor.as_strided(
-                b.size(), b.stride(), b.storage_offset()
-            )
-        else:
-            reshaped_base_tensor = aliased_base_tensor
+    reshaped_base_tensor = _reshape_base_for_view_replay(
+        aliased_base_tensor, target_meta_tensor
+    )
+    if reshaped_base_tensor is not None:
         out = target_meta_tensor._view_func(reshaped_base_tensor)  # type: ignore[attr-defined]
         # This shape mismatch can happen due to a bug in inplace/view handling in autograd.
         # Try putting a breakpoint here and running
@@ -379,7 +388,7 @@ def gen_alias_from_base(
         #
         # As a stopgap, we'll fall back to as_strided.
         if out is not None and out.shape == target_meta_tensor.shape:
-            return patch_requires_grad(out)
+            return _patch_requires_grad(aliased_base_tensor, out, target_requires_grad)
 
     size = target_meta_tensor.size()
     stride = target_meta_tensor.stride()
@@ -411,12 +420,102 @@ def gen_alias_from_base(
     else:
         aliased_out = aliased_base_tensor.as_strided(size, stride, storage_offset)
     # For outputs aliasing inputs, we need to check if the requires-gradness has changed.
-    aliased_out = patch_requires_grad(aliased_out)
+    aliased_out = _patch_requires_grad(
+        aliased_base_tensor, aliased_out, target_requires_grad
+    )
     # For outputs aliasing inputs, we need to check if the dtype has changed.
     # as_strided() is the "most generic" view, but it does not cover cross-dtype views
     if aliased_out.dtype != target_meta_tensor.dtype:
         aliased_out = aliased_out.view(target_meta_tensor.dtype)
     return aliased_out
+
+
+def gen_aliases_from_multi_output_view(
+    aliased_base_tensor: Tensor,
+    target_meta_tensors: Sequence[Tensor],
+    target_requires_grads: Sequence[bool],
+    target_view_meta_sequences: Sequence[ViewMetaSequence | None],
+    target_output_indices: Sequence[int],
+    *,
+    replay_views: bool,
+) -> list[Tensor]:
+    """Replay one terminal multi-output view and select the requested siblings.
+
+    The four target sequences are positionally aligned, and output indices refer
+    to the full result of the shared multi-output operation. The returned tensors
+    preserve that requested order. If batched replay is unavailable, each target
+    is regenerated independently through ``gen_alias_from_base``.
+    """
+    expected_len = len(target_meta_tensors)
+    if not (
+        len(target_requires_grads)
+        == len(target_view_meta_sequences)
+        == len(target_output_indices)
+        == expected_len
+    ):
+        raise AssertionError("multi-output view metadata lengths must match")
+    if expected_len == 0:
+        return []
+
+    def select_replayed_outputs(replayed_outs: Sequence[Tensor]) -> list[Tensor] | None:
+        if (
+            not replayed_outs
+            or min(target_output_indices) < 0
+            or max(target_output_indices) >= len(replayed_outs)
+        ):
+            return None
+        selected_outs = [replayed_outs[i] for i in target_output_indices]
+        if not all(
+            out.shape == target.shape
+            for out, target in zip(selected_outs, target_meta_tensors, strict=True)
+        ):
+            return None
+        return [
+            _patch_requires_grad(aliased_base_tensor, out, requires_grad)
+            for out, requires_grad in zip(
+                selected_outs, target_requires_grads, strict=True
+            )
+        ]
+
+    reshaped_base_tensor = _reshape_base_for_view_replay(
+        aliased_base_tensor, target_meta_tensors[0]
+    )
+    if reshaped_base_tensor is not None:
+        replayed_outs = target_meta_tensors[0]._view_func_multi_output(  # type: ignore[attr-defined]
+            reshaped_base_tensor
+        )
+        selected_outs = select_replayed_outputs(replayed_outs)
+        if selected_outs is not None:
+            return selected_outs
+
+    first_view_meta_sequence = target_view_meta_sequences[0]
+    if (
+        replay_views
+        and first_view_meta_sequence is not None
+        and not any(vm.has_symbolic_inputs for vm in first_view_meta_sequence.sequence)
+    ):
+        replayed_outs = _functionalization.apply_multi_output_view_meta_sequence(
+            aliased_base_tensor, first_view_meta_sequence.sequence
+        )
+        selected_outs = select_replayed_outputs(replayed_outs)
+        if selected_outs is not None:
+            return selected_outs
+
+    return [
+        gen_alias_from_base(
+            aliased_base_tensor,
+            target_meta_tensor,
+            target_requires_grad,
+            target_view_meta_sequence,
+            replay_views=replay_views,
+        )
+        for target_meta_tensor, target_requires_grad, target_view_meta_sequence in zip(
+            target_meta_tensors,
+            target_requires_grads,
+            target_view_meta_sequences,
+            strict=True,
+        )
+    ]
 
 
 def has_same_metadata(t1: Tensor, t2: Tensor) -> bool:

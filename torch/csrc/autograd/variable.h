@@ -387,6 +387,13 @@ struct TORCH_API ViewFunc {
   }
   /// Reapplies the view on the given base using the saved state.
   virtual at::Tensor operator()(const at::Tensor&) const = 0;
+  /// Reapplies a multi-output view on the given base and returns all outputs.
+  /// Returns an empty list when this ViewFunc does not represent a
+  /// multi-output view.
+  virtual std::vector<at::Tensor> call_multi_output(
+      const at::Tensor& /*unused*/) const {
+    return {};
+  }
   /// Returns a clone of this ViewFunc, optionally with the specified saved
   /// state.
   virtual std::unique_ptr<ViewFunc> clone_and_set(
@@ -422,6 +429,8 @@ struct ChainedViewFunc : public ViewFunc {
     return first->num_tensors() + second->num_tensors();
   }
   at::Tensor operator()(
+      const at::Tensor& /*input_base*/ /*unused*/) const override;
+  std::vector<at::Tensor> call_multi_output(
       const at::Tensor& /*input_base*/ /*unused*/) const override;
   std::unique_ptr<ViewFunc> clone_and_set(
       std::optional<std::vector<c10::SymInt>> /*symints*/ /*unused*/ =

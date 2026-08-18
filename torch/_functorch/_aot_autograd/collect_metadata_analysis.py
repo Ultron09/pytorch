@@ -318,6 +318,7 @@ def run_functionalized_fw_and_collect_metadata(
         num_aliased_tensors_that_are_multi_output_views: collections.defaultdict[
             StorageWeakRef | None, int
         ] = collections.defaultdict(int)
+        multi_output_view_tensor_ids: set[int] = set()
 
         out_storage_to_metadata_key_to_tensors: collections.defaultdict[
             StorageWeakRef | None,
@@ -414,6 +415,7 @@ def run_functionalized_fw_and_collect_metadata(
                 )
                 if is_cur_tensor_multi_out_view:
                     num_aliased_tensors_that_are_multi_output_views[curr_storage] += 1
+                    multi_output_view_tensor_ids.add(id(o))
                 if o.requires_grad:
                     out_storage_to_metadata_key_to_tensors[curr_storage][
                         MetadataKey.make(o)
@@ -423,6 +425,7 @@ def run_functionalized_fw_and_collect_metadata(
         intermediate_base_tensor_id_to_output_idx: dict[int, int] = {}
         intermediate_bases: list[torch.Tensor] = []
         intermediate_bases_descs: list[AOTInput] = []
+        input_multi_output_view_groups: dict[Any, int] = {}
         # Why Do We Care If Storage Changed?
         # It's important to understand the implications of storage changes in complex scenarios. Take this example:
         #
@@ -505,33 +508,12 @@ def run_functionalized_fw_and_collect_metadata(
                 # pyrefly: ignore [bad-index, index-error]
                 base_idx = inp_storage_refs[curr_storage]
                 is_input_tensor = id(o) in inp_tensor_ids
-                num_aliased_outs = out_tensor_alias_counts[curr_storage]
-                num_multi_output_view_outs = (
-                    num_aliased_tensors_that_are_multi_output_views[curr_storage]
-                )
-                num_aliased_outs_that_are_not_multi_output_views = (
-                    num_aliased_outs - num_multi_output_view_outs
-                )
-                if (
-                    grad_fn is not None
-                    and num_aliased_outs_that_are_not_multi_output_views == 0
-                ):
-                    # See Note: [AOTAutograd: differentiable outputs that alias each other from a multi-output view call]
-                    # In particular, given:
-                    # def f(x):
-                    #     return list(x.unbind(0))
-                    # The main reason we ordinarily try to regenerate these output aliases outside of the
-                    # compiled autograd.Function is because if any of the outputs are later mutated,
-                    # autograd needs to perform view-replay to regenerate them.
-                    # However, autograd does not allow users to mutate multi-output views
-                    # in any way that can change the autograd metadata of other aliases.
-                    # So we hide this aliasing from autograd here.
-                    log.debug(
-                        "Encountered AOTAutograd case: differentiable outputs that \
-alias each other from a multi-output view call"
-                    )
-                    output_type = OutputType.non_alias
-                elif is_input_tensor:
+                # Preserve input aliasing even for multi-output views (e.g.
+                # unbind/split). Otherwise pure view functions get a shared
+                # CompiledFunctionBackward instead of replaying views from the
+                # input, and individual backwards over outputs incorrectly
+                # re-enter that node after its saved tensors are freed.
+                if is_input_tensor:
                     output_type = OutputType.is_input
                 else:
                     output_type = OutputType.alias_of_input
@@ -686,6 +668,22 @@ from a multi-output view call"
                     view_meta_sequence = ViewMetaSequence(o)
 
             requires_grad = isinstance(o, torch.Tensor) and o.requires_grad
+            multi_output_view_group = None
+            multi_output_view_index = None
+            if (
+                output_type == OutputType.alias_of_input
+                and id(o) in multi_output_view_tensor_ids
+                and grad_fn is not None
+                and view_meta_sequence is not None
+                and view_meta_sequence.sequence
+                and view_meta_sequence.sequence[-1].is_multi_output
+            ):
+                if grad_fn not in input_multi_output_view_groups:
+                    input_multi_output_view_groups[grad_fn] = len(
+                        input_multi_output_view_groups
+                    )
+                multi_output_view_group = input_multi_output_view_groups[grad_fn]
+                multi_output_view_index = int(o.output_nr)
             out_info = OutputAliasInfo(
                 output_type=output_type,
                 raw_type=type(o),
@@ -698,6 +696,8 @@ from a multi-output view call"
                 requires_grad_for_backward=requires_grad
                 and (o._base is None or grad_fn is not None),
                 view_meta_sequence=view_meta_sequence,
+                multi_output_view_group=multi_output_view_group,
+                multi_output_view_index=multi_output_view_index,
             )
             output_info.append(out_info)
 

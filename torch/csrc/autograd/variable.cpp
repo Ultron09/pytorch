@@ -896,6 +896,11 @@ at::Tensor ChainedViewFunc::operator()(const at::Tensor& input_base) const {
   return (*second)((*first)(input_base));
 }
 
+std::vector<at::Tensor> ChainedViewFunc::call_multi_output(
+    const at::Tensor& input_base) const {
+  return second->call_multi_output((*first)(input_base));
+}
+
 std::unique_ptr<ViewFunc> ChainedViewFunc::clone_and_set(
     std::optional<std::vector<c10::SymInt>> symints,
     std::optional<std::vector<at::Tensor>> tensors) const {

@@ -62,7 +62,7 @@ from .descriptors import (
     SyntheticBaseAOTInput,
     ViewBaseAOTInput,
 )
-from .functional_utils import gen_alias_from_base
+from .functional_utils import gen_alias_from_base, gen_aliases_from_multi_output_view
 from .graph_capture_wrappers import aot_dispatch_subclass
 from .input_output_analysis import (
     compute_overlapping_inputs,
@@ -247,6 +247,8 @@ class AliasOfInputHandler:
         self.requires_grad = info.requires_grad
         self.view_meta_sequence = info.view_meta_sequence
         self.replay_views = config.view_replay_for_aliased_outputs
+        self.multi_output_view_group = info.multi_output_view_group
+        self.multi_output_view_index = info.multi_output_view_index
 
     def __call__(
         self, orig_inputs: dict[int, Tensor], fw_outs: list[Any], out: Any
@@ -345,6 +347,49 @@ def make_output_handler(
 ):
     handler_type = _HANDLER_MAP[info.output_type]
     return handler_type(info, runtime_metadata, trace_joint)
+
+
+_OutputHandler = (
+    NoopAliasHandler | AliasOfInputHandler | IsInputHandler | AliasOfIntermediateHandler
+)
+
+
+@dataclass(frozen=True)
+class _MultiOutputViewGroupInfo:
+    member_indices: tuple[int, ...]
+    input_handlers: tuple[AliasOfInputHandler, ...]
+    base_idx: int
+    output_indices: tuple[int, ...]
+    replay_views: bool
+    member_positions: dict[int, int]
+
+
+def _multi_output_view_group_info(
+    output_handlers: Sequence[_OutputHandler], member_indices: Sequence[int]
+) -> _MultiOutputViewGroupInfo:
+    member_handlers = [output_handlers[i] for i in member_indices]
+    if not all(isinstance(h, AliasOfInputHandler) for h in member_handlers):
+        raise AssertionError("multi-output view group must contain input aliases")
+    input_handlers = typing.cast(list[AliasOfInputHandler], member_handlers)
+    base_idx = input_handlers[0].base_idx
+    if not all(h.base_idx == base_idx for h in input_handlers):
+        raise AssertionError("multi-output view group must share an input base")
+    output_indices = tuple(h.multi_output_view_index for h in input_handlers)
+    if not all(isinstance(idx, int) for idx in output_indices):
+        raise AssertionError("multi-output view group must have output indices")
+    replay_views = input_handlers[0].replay_views
+    if not all(h.replay_views == replay_views for h in input_handlers):
+        raise AssertionError("multi-output view group must share replay config")
+    return _MultiOutputViewGroupInfo(
+        member_indices=tuple(member_indices),
+        input_handlers=tuple(input_handlers),
+        base_idx=base_idx,
+        output_indices=typing.cast(tuple[int, ...], output_indices),
+        replay_views=replay_views,
+        member_positions={
+            member_idx: position for position, member_idx in enumerate(member_indices)
+        },
+    )
 
 
 # _dynamo_propagated_dynamic_indices: A guardless attribute for cross-graph-break
@@ -803,10 +848,43 @@ class _RuntimeForwardEpilogue:
             raise AssertionError(
                 f"expected {expect_num_outputs} fw_outs, got {len(fw_outs)}"
             )
-        return [
-            handler(orig_inputs, fw_outs, out)
-            for out, handler in zip(fw_outs, self.output_handlers)
-        ]
+        replayed_groups: dict[int, dict[int, Tensor]] = {}
+        ret_outs = []
+        for i, (out, handler) in enumerate(zip(fw_outs, self.output_handlers)):
+            if (
+                isinstance(handler, AliasOfInputHandler)
+                and handler.multi_output_view_group is not None
+            ):
+                group = handler.multi_output_view_group
+                if group not in replayed_groups:
+                    member_indices = self.runtime_metadata.multi_output_view_groups[
+                        group
+                    ]
+                    group_info = _multi_output_view_group_info(
+                        self.output_handlers, member_indices
+                    )
+                    replayed = gen_aliases_from_multi_output_view(
+                        orig_inputs[group_info.base_idx],
+                        [
+                            h.unwrap_out(fw_outs[j])
+                            for j, h in zip(
+                                group_info.member_indices,
+                                group_info.input_handlers,
+                                strict=True,
+                            )
+                        ],
+                        [h.requires_grad for h in group_info.input_handlers],
+                        [h.view_meta_sequence for h in group_info.input_handlers],
+                        group_info.output_indices,
+                        replay_views=group_info.replay_views,
+                    )
+                    replayed_groups[group] = dict(
+                        zip(group_info.member_indices, replayed, strict=True)
+                    )
+                ret_outs.append(replayed_groups[group][i])
+            else:
+                ret_outs.append(handler(orig_inputs, fw_outs, out))
+        return ret_outs
 
 
 def _codegen_capture_orig_inputs(
@@ -997,16 +1075,62 @@ def _create_runtime_wrapper(
         )
         buf.bind(
             gen_alias_from_base=gen_alias_from_base,
+            gen_aliases_from_multi_output_view=gen_aliases_from_multi_output_view,
             _unwrap_tensoralias=_unwrap_tensoralias,
         )
+        multi_output_group_infos = {
+            group: _multi_output_view_group_info(output_handlers, member_indices)
+            for group, member_indices in runtime_metadata.multi_output_view_groups.items()
+        }
         with buf.indent():
             buf.writeline("ret_outs = []")
+            emitted_multi_output_groups: set[int] = set()
             for i, handler in enumerate(output_handlers):
                 if isinstance(handler, NoopAliasHandler):
                     buf.writeline(f"ret_outs.append(fw_outs[{i}])")
                 elif isinstance(handler, IsInputHandler):
                     buf.writeline(f"ret_outs.append(orig_inputs[{handler.base_idx}])")
                 elif isinstance(handler, AliasOfInputHandler):
+                    if handler.multi_output_view_group is not None:
+                        group = handler.multi_output_view_group
+                        group_info = multi_output_group_infos[group]
+                        if group not in emitted_multi_output_groups:
+                            target_exprs = [
+                                (
+                                    f"_unwrap_tensoralias(fw_outs[{j}])"
+                                    if trace_joint
+                                    else f"fw_outs[{j}]"
+                                )
+                                for j in group_info.member_indices
+                            ]
+                            targets_expr = (
+                                f"({', '.join(target_exprs)}"
+                                f"{',' if len(target_exprs) == 1 else ''})"
+                            )
+                            requires_grads = tuple(
+                                h.requires_grad for h in group_info.input_handlers
+                            )
+                            view_meta_sequences = tuple(
+                                h.view_meta_sequence for h in group_info.input_handlers
+                            )
+                            vms_name = buf.bind_value(
+                                "_multi_output_vms", view_meta_sequences
+                            )
+                            buf.writeline(
+                                f"multi_output_view_group_{group} = "
+                                f"gen_aliases_from_multi_output_view("
+                                f"orig_inputs[{group_info.base_idx}], {targets_expr}, "
+                                f"{requires_grads!r}, {vms_name}, "
+                                f"{group_info.output_indices!r}, "
+                                f"replay_views={group_info.replay_views!r})"
+                            )
+                            emitted_multi_output_groups.add(group)
+                        group_output_idx = group_info.member_positions[i]
+                        buf.writeline(
+                            f"ret_outs.append(multi_output_view_group_{group}"
+                            f"[{group_output_idx}])"
+                        )
+                        continue
                     vms_name = buf.bind_value("_vms", handler.view_meta_sequence)
                     out_expr = (
                         f"_unwrap_tensoralias(fw_outs[{i}])"

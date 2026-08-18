@@ -105,6 +105,9 @@ struct ViewMeta {
   virtual ~ViewMeta() = default;
 
   virtual Tensor forward(const Tensor& base) = 0;
+  virtual std::vector<Tensor> forward_multi_output(const Tensor& /*unused*/) {
+    return {};
+  }
   virtual Tensor reverse(const Tensor& base, const Tensor& mutated_view) = 0;
 
   // See Note [out_idx in ViewMeta]

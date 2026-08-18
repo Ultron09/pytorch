@@ -2049,7 +2049,8 @@ def forward(self, primals_1):
             out_test2[0].grad_fn
 
     def test_output_aliases_input_multi_output_view(self):
-        # All aliased outs are from multi-output views, so AOTAutograd will hide the aliasing from autograd.
+        # When multi-output views alias inputs, AOTAutograd regenerates the views
+        # instead of sending them through a compiled autograd.Function.
         def f1(a):
             return list(a.unbind(0))
 
@@ -2059,16 +2060,19 @@ def forward(self, primals_1):
 
         out_ref = f1(inp_ref)
         out_test = f1_compiled(inp)
-        # Assert that we get CompiledFunctionBackward in the backward graph,
-        # and not AsStridedBackward. No view-regeneration necessary for this mult-output view case.
-        # See Note: [AOTAutograd: differentiable outputs that alias each other from a multi-output view call]
-        self.assertTrue(
-            all("CompiledFunctionBackward" in str(o.grad_fn) for o in out_test)
-        )
+        # Assert that we replay the multi-output view, instead of giving all
+        # outputs a shared CompiledFunctionBackward node.
+        self.assertTrue(all("UnbindBackward" in str(o.grad_fn) for o in out_test))
 
         sum(out_ref).sum().backward()
         sum(out_test).sum().backward()
         self.assertEqual(inp_ref.grad, inp.grad)
+
+        inp = torch.ones(3, 3, requires_grad=True)
+        out_test = f1_compiled(inp)
+        for out in out_test:
+            out.sum().backward()
+        self.assertEqual(inp.grad, torch.ones_like(inp))
 
         # Several of the outputs are from multi-output views.
         # However: they are part of the same alias set as "a", and "a.view(out.shape)",
@@ -2098,6 +2102,125 @@ def forward(self, primals_1):
         (inp_ref + out_ref[-1]).sum().backward()
         (inp + out_test[-1]).sum().backward()
         self.assertEqual(inp_ref.grad, inp.grad)
+
+    @parametrize("view_replay_for_aliased_outputs", [False, True])
+    def test_output_aliases_input_multi_output_view_replayed_once(
+        self, view_replay_for_aliased_outputs
+    ):
+        class OpCounterMode(TorchDispatchMode):
+            def __init__(self, op):
+                super().__init__()
+                self.op = op
+                self.count = 0
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func == self.op:
+                    self.count += 1
+                return func(*args, **(kwargs or {}))
+
+        def f(a):
+            views = a.unbind(0)
+            return *views[::-1], a.sin()
+
+        with torch._functorch.config.patch(
+            view_replay_for_aliased_outputs=view_replay_for_aliased_outputs
+        ):
+            pure_compiled = aot_function(lambda a: a.unbind(0), nop)
+            pure_compiled(torch.randn(8, 8, requires_grad=True))
+            pure_mode = OpCounterMode(torch.ops.aten.unbind.int)
+            with pure_mode:
+                pure_outs = pure_compiled(torch.randn(8, 8, requires_grad=True))
+
+            split_compiled = aot_function(lambda a: torch.split(a, 2, 0)[::-1], nop)
+            split_compiled(torch.randn(7, 3, requires_grad=True))
+            split_inp = torch.randn(7, 3, requires_grad=True)
+            split_mode = OpCounterMode(torch.ops.aten.split.Tensor)
+            with split_mode:
+                split_outs = split_compiled(split_inp)
+
+            f_compiled = aot_function(f, nop)
+            f_compiled(torch.randn(8, 8, requires_grad=True))
+
+            inp = torch.randn(8, 8, requires_grad=True)
+            mode = OpCounterMode(torch.ops.aten.unbind.int)
+            with mode:
+                outs = f_compiled(inp)
+
+        # Pure-view graphs can lower their compiled outputs to as_strided
+        # views, so the functionalization recipe is the reliable grouped
+        # replay path. With view replay disabled, the O(K) as_strided fallback
+        # does not execute unbind at all in the epilogue.
+        if view_replay_for_aliased_outputs:
+            self.assertEqual(pure_mode.count, 2)
+            self.assertEqual(split_mode.count, 2)
+        else:
+            self.assertLessEqual(pure_mode.count, 2)
+            self.assertLessEqual(split_mode.count, 2)
+        self.assertEqual(split_outs, torch.split(split_inp, 2, 0)[::-1])
+        if view_replay_for_aliased_outputs:
+            self.assertTrue(all(o.grad_fn is pure_outs[0].grad_fn for o in pure_outs))
+
+        # The compiled graph runs unbind once, and alias regeneration replays
+        # it once more for all sibling outputs. Replaying each output
+        # independently would run it 1 + len(outs[:-1]) times.
+        self.assertEqual(mode.count, 2)
+        self.assertEqual(outs[:-1], inp.unbind(0)[::-1])
+        self.assertTrue(all("UnbindBackward" in str(o.grad_fn) for o in outs[:-1]))
+        self.assertTrue(all(o.grad_fn is outs[0].grad_fn for o in outs[:-1]))
+
+        # The non-alias output owns the compiled backward. Freeing that context
+        # must not affect later backwards through the regenerated input views.
+        outs[-1].sum().backward()
+        for out in outs[:-1]:
+            out.sum().backward()
+        self.assertEqual(inp.grad, inp.cos() + torch.ones_like(inp))
+
+    def test_separate_multi_output_view_calls_are_not_grouped(self):
+        def f(a):
+            first = a.unbind(0)
+            second = a.unbind(0)
+            return *first, *second
+
+        f_compiled = aot_function(f, nop)
+        inp = torch.randn(4, 3, requires_grad=True)
+        outs = f_compiled(inp)
+        first, second = outs[:4], outs[4:]
+        self.assertTrue(all(o.grad_fn is first[0].grad_fn for o in first))
+        self.assertTrue(all(o.grad_fn is second[0].grad_fn for o in second))
+        self.assertIsNot(first[0].grad_fn, second[0].grad_fn)
+
+    def test_multi_output_view_replay_prefix_and_suffix(self):
+        def prefix(a):
+            return a.transpose(0, 1).unbind(0)
+
+        def suffix(a):
+            return tuple(out.unsqueeze(0) for out in a.unbind(0))
+
+        with torch._functorch.config.patch(view_replay_for_aliased_outputs=True):
+            prefix_compiled = aot_function(prefix, nop)
+            prefix_inp = torch.randn(3, 4, requires_grad=True)
+            prefix_outs = prefix_compiled(prefix_inp)
+            self.assertEqual(prefix_outs, prefix(prefix_inp))
+            self.assertTrue(
+                all(out.grad_fn is prefix_outs[0].grad_fn for out in prefix_outs)
+            )
+
+            # A view after the multi-output operation has a different terminal
+            # ViewFunc for each output, so it safely uses per-output replay.
+            suffix_compiled = aot_function(suffix, nop)
+            suffix_inp = torch.randn(4, 3, requires_grad=True)
+            suffix_outs = suffix_compiled(suffix_inp)
+            self.assertEqual(suffix_outs, suffix(suffix_inp))
+            self.assertTrue(
+                all(
+                    out.grad_fn is not suffix_outs[0].grad_fn for out in suffix_outs[1:]
+                )
+            )
+
+            sum(out.sum() for out in prefix_outs).backward()
+            sum(out.sum() for out in suffix_outs).backward()
+            self.assertEqual(prefix_inp.grad, torch.ones_like(prefix_inp))
+            self.assertEqual(suffix_inp.grad, torch.ones_like(suffix_inp))
 
     def test_output_aliases_intermediate_multi_output_view(self):
         # All aliased outs are from multi-output views, so AOTAutograd will hide the aliasing from autograd.
