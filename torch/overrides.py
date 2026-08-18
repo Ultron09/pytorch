@@ -1567,6 +1567,59 @@ def get_testing_overrides() -> dict[Callable, Callable]:
 
     ret.update(ret2)
 
+    # Foreach functions are added after the auto-generation loop above to avoid
+    # generating Tensor method entries for functions with matching names.
+    ret.update(
+        {
+            torch.foreach.abs: lambda inputs: -1,
+            torch.foreach.acos: lambda inputs: -1,
+            torch.foreach.add: lambda inputs, other, *, alpha=1: -1,
+            torch.foreach.addcdiv: lambda inputs, tensor1, tensor2, value=1: -1,
+            torch.foreach.addcmul: lambda inputs, tensor1, tensor2, value=1: -1,
+            torch.foreach.asin: lambda inputs: -1,
+            torch.foreach.atan: lambda inputs: -1,
+            torch.foreach.ceil: lambda inputs: -1,
+            torch.foreach.clamp_max: lambda inputs, max: -1,
+            torch.foreach.clamp_min: lambda inputs, min: -1,
+            torch.foreach.clone: (lambda inputs, *, memory_format=None: -1),
+            torch.foreach.cos: lambda inputs: -1,
+            torch.foreach.cosh: lambda inputs: -1,
+            torch.foreach.div: lambda inputs, other: -1,
+            torch.foreach.erf: lambda inputs: -1,
+            torch.foreach.erfc: lambda inputs: -1,
+            torch.foreach.exp: lambda inputs: -1,
+            torch.foreach.expm1: lambda inputs: -1,
+            torch.foreach.floor: lambda inputs: -1,
+            torch.foreach.frac: lambda inputs: -1,
+            torch.foreach.lerp: lambda inputs, end, weight: -1,
+            torch.foreach.lgamma: lambda inputs: -1,
+            torch.foreach.log: lambda inputs: -1,
+            torch.foreach.log10: lambda inputs: -1,
+            torch.foreach.log1p: lambda inputs: -1,
+            torch.foreach.log2: lambda inputs: -1,
+            torch.foreach.max: lambda inputs: -1,
+            torch.foreach.maximum: lambda inputs, other: -1,
+            torch.foreach.minimum: lambda inputs, other: -1,
+            torch.foreach.mm: lambda inputs, mat2: -1,
+            torch.foreach.mul: lambda inputs, other: -1,
+            torch.foreach.neg: lambda inputs: -1,
+            torch.foreach.norm: lambda inputs, ord=2, dtype=None: -1,
+            torch.foreach.pow: lambda input, exponent: -1,
+            torch.foreach.reciprocal: lambda inputs: -1,
+            torch.foreach.round: lambda inputs: -1,
+            torch.foreach.rsqrt: lambda inputs: -1,
+            torch.foreach.sigmoid: lambda inputs: -1,
+            torch.foreach.sign: lambda inputs: -1,
+            torch.foreach.sin: lambda inputs: -1,
+            torch.foreach.sinh: lambda inputs: -1,
+            torch.foreach.sqrt: lambda inputs: -1,
+            torch.foreach.sub: lambda inputs, other, *, alpha=1: -1,
+            torch.foreach.tan: lambda inputs: -1,
+            torch.foreach.tanh: lambda inputs: -1,
+            torch.foreach.trunc: lambda inputs: -1,
+        }
+    )
+
     # Distributed functions are added after the auto-generation loop above
     # to avoid generating spurious Tensor method entries (e.g., dist.reduce
     # would otherwise generate __reduce__ on Tensor).
@@ -1871,6 +1924,7 @@ def _get_overridable_functions() -> tuple[
         ("torch.Tensor", torch.Tensor, dir(torch.Tensor)),
         ("torch.linalg", torch.linalg, dir(torch.linalg)),
         ("torch.fft", torch.fft, dir(torch.fft)),
+        ("torch.foreach", torch.foreach, torch.foreach.__all__),
         ("torch.special", torch.special, dir(torch.special)),
     ]
     for namespace_str, namespace, ns_funcs in tested_namespaces:

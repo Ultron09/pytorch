@@ -926,12 +926,11 @@ False
     vdot
 ```
 
-### Foreach Operations
+### Private foreach compatibility functions
 
-:::{warning}
-This API is in beta and subject to future changes.
-Forward-mode AD is not supported.
-:::
+The private `torch._foreach_*` functions remain available to support
+backwards compatibility during migration. However, we recommend the
+public foreach APIs; new code should use {mod}`torch.foreach`.
 
 ```{eval-rst}
 .. autosummary::

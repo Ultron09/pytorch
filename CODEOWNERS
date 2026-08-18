@@ -150,6 +150,7 @@
 # /aten/src/ATen/native/FusedSGD.cpp
 # /aten/src/ATen/native/FusedSGD.h
 # /test/test_functional_optim.py
+/torch/foreach/ @janeyx99
 /torch/optim/ @albanD @janeyx99
 #
 # [core_aten_runtime]
