@@ -982,6 +982,28 @@ class TestPatternMatcher(TestCase):
         result = torch.compile(fn, fullgraph=True)()
         self.assertEqual(result, expected)
 
+    @dynamo_config.patch(capture_scalar_outputs=True)
+    @parametrize("dtype", [torch.int64, torch.float32])
+    def test_pointless_cumsum_symbolic_fill(self, dtype):
+        # fill_value reaches the pattern as an fx Node either from an unbacked
+        # .item(), or - the second closure below - from a recompile of the same code
+        # object with a different constant in its cell.
+        def unbacked(x):
+            return torch.full((2,), x.item(), dtype=dtype).cumsum(0).sum()
+
+        x = torch.tensor(3)
+        self.assertEqual(torch.compile(unbacked, fullgraph=True)(x), unbacked(x))
+
+        def make(fill):
+            def fn():
+                return torch.full((2,), fill, dtype=dtype).cumsum(0).sum()
+
+            return fn
+
+        for fill in (1, 2):
+            fn = make(fill)
+            self.assertEqual(torch.compile(fn, fullgraph=True)(), fn())
+
     def test_reciprocal_sqrt_to_rsqrt(self):
         # reciprocal(sqrt(x)) should fuse into a single rsqrt in the kernel.
         def fn(x):
