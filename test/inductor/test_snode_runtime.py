@@ -1,7 +1,6 @@
 # Owner(s): ["module: inductor"]
 
 import contextlib
-from unittest import skipIf
 
 import torch
 import torch.distributed as dist
@@ -16,7 +15,6 @@ from torch.testing._internal.common_device_type import (
     requires_capabilities,
 )
 from torch.testing._internal.common_utils import HardwareClassification
-from torch.utils._triton import has_triton
 
 
 aten = torch.ops.aten
@@ -99,7 +97,6 @@ class UnsupportedTests(TestCase):
 class UnsupportedTestsGeneric(TestCase):
     hw_classification = HardwareClassification.GENERIC
 
-    @skipIf(not has_triton(), "requires triton")
     def test_no_cuda(self):
         def f(a):
             return a
@@ -312,7 +309,7 @@ class InputDistanceTests(TestCase):
         self.assertGreaterEqual(max(all_max), 1)
 
 
-@skipIf(not dist.is_available(), "requires distributed")
+@requires_capabilities(Capability.distributed.backend)
 class TestCommAnalysis(TestCase):
     WORLD_SIZE: int = 8
     RANKS = list(range(8))
