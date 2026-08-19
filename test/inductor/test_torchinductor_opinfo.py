@@ -23,7 +23,7 @@ from torch._subclasses.fake_tensor import (
 from torch.testing._internal.common_cuda import SM80OrLater
 from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
-    onlyNativeDeviceTypes,
+    onlyAccelerator,
     OpDTypes,
     ops,
     skipCPUIf,
@@ -1304,7 +1304,7 @@ class TestInductorOpInfo(TestCase):
     check_model = check_model
     check_model_gpu = check_model_gpu
 
-    @onlyNativeDeviceTypes
+    @onlyAccelerator
     @suppress_warnings
     @skipCUDAMemoryLeakCheckIf(
         True
