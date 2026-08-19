@@ -398,10 +398,11 @@ class Method:
 class GetSet:
     """`tp_getset` entry, analogous to CPython's PyGetSetDef. `getter`
     `(self, tx) -> VT | None` (None declines); `setter`
-    `(self, tx, value) -> VT | None`, None for read-only."""
+    `(self, tx, value) -> VT | None` (None declines), and a `setter` of None
+    means read-only."""
 
     getter: Callable[..., VariableTracker | None]
-    setter: Callable[..., VariableTracker | None] | None = None
+    setter: Callable[..., VariableTracker | None] | None
 
 
 @dataclasses.dataclass(slots=True)
@@ -410,7 +411,7 @@ class Member:
     GetSet; a distinct type so members and getsets never share a class."""
 
     getter: Callable[..., VariableTracker | None]
-    setter: Callable[..., VariableTracker | None] | None = None
+    setter: Callable[..., VariableTracker | None] | None
 
 
 def getset_read(
@@ -427,18 +428,11 @@ def getset_build(
     return lambda self, tx: VariableTracker.build(tx, accessor(self))
 
 
-def unsupported_attr(name: str) -> Callable[..., VariableTracker | None]:
-    def graph_break(
-        vt: VariableTracker, tx: InstructionTranslatorBase
-    ) -> VariableTracker | None:
-        unimplemented(
-            gb_type="Unsupported attribute",
-            context=f"attr_unsupported {vt} {name}",
-            explanation=f"{type(vt).__name__} does not support attribute '{name}'",
-            hints=[*graph_break_hints.DYNAMO_BUG],
-        )
-
-    return graph_break
+def getset_set(
+    accessor: Callable[[Any, Any, VariableTracker], None],
+) -> Callable[..., None]:
+    """Setter for a GetSet/Member whose value is an already-built VT."""
+    return lambda self, tx, val: accessor(self, tx, val)
 
 
 # This helps users of `as_python_constant` to catch unimplemented error with
