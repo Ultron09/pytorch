@@ -23,6 +23,58 @@
 
 namespace torch::inductor {
 
+namespace {
+// RAII: fires observer->onBegin on construction and onEnd on destruction, so
+// the bracketed region is timed even if it throws. No-op when observer is null.
+class ScopedObserverEvent {
+ public:
+  ScopedObserverEvent(
+      AOTIModelContainerObserver* observer,
+      AOTIContainerEvent event,
+      AOTIObserverContext ctx)
+      : observer_(observer), event_(event), ctx_(ctx) {
+    if (observer_ != nullptr) {
+      // Observers must not throw. Contain a throwing onBegin here rather than
+      // letting it escape: an exception out of the constructor skips the
+      // destructor, which would drop the paired onEnd and leave the observer
+      // seeing unbalanced events.
+      try {
+        observer_->onBegin(event_, ctx_);
+      } catch (...) {
+        TORCH_WARN(
+            "AOTI observer onBegin threw for event ",
+            static_cast<int>(event_),
+            "; ignoring");
+      }
+    }
+  }
+  ~ScopedObserverEvent() {
+    if (observer_ != nullptr) {
+      // A throwing onEnd during stack unwinding would call std::terminate;
+      // swallow defensively, but say so -- a silently broken observer is
+      // exactly the thing this instrumentation exists to avoid.
+      try {
+        observer_->onEnd(event_, ctx_);
+      } catch (...) {
+        TORCH_WARN(
+            "AOTI observer onEnd threw for event ",
+            static_cast<int>(event_),
+            "; ignoring");
+      }
+    }
+  }
+  ScopedObserverEvent(const ScopedObserverEvent&) = delete;
+  ScopedObserverEvent& operator=(const ScopedObserverEvent&) = delete;
+  ScopedObserverEvent(ScopedObserverEvent&&) = delete;
+  ScopedObserverEvent& operator=(ScopedObserverEvent&&) = delete;
+
+ private:
+  AOTIModelContainerObserver* observer_;
+  AOTIContainerEvent event_;
+  AOTIObserverContext ctx_;
+};
+} // namespace
+
 AOTIModelContainerRunner::AOTIModelContainerRunner() = default;
 
 AOTIModelContainerRunner::AOTIModelContainerRunner(
@@ -239,6 +291,8 @@ std::vector<at::Tensor> AOTIModelContainerRunner::run_impl(
 std::vector<at::Tensor> AOTIModelContainerRunner::run(
     const std::vector<at::Tensor>& inputs,
     void* stream_handle) {
+  ScopedObserverEvent observer_event(
+      observer(), AOTIContainerEvent::kInference, {});
   std::vector<AtenTensorHandle> input_handles =
       torch::aot_inductor::unsafe_alloc_new_handles_from_tensors(inputs);
   return run_impl(input_handles, stream_handle);
@@ -247,6 +301,8 @@ std::vector<at::Tensor> AOTIModelContainerRunner::run(
 std::vector<at::Tensor> AOTIModelContainerRunner::boxed_run(
     std::vector<at::Tensor>&& inputs,
     void* stream_handle) {
+  ScopedObserverEvent observer_event(
+      observer(), AOTIContainerEvent::kInference, {});
   std::vector<AtenTensorHandle> input_handles =
       torch::aot_inductor::unsafe_alloc_new_handles_from_tensors(inputs);
   std::move(inputs).clear();
@@ -309,6 +365,11 @@ void AOTIModelContainerRunner::update_constant_buffer(
     bool use_inactive,
     bool check_full_update,
     bool user_managed) {
+  AOTIObserverContext ctx;
+  ctx.num_constants = const_map.size();
+  ctx.use_inactive = use_inactive;
+  ScopedObserverEvent observer_event(
+      observer(), AOTIContainerEvent::kUpdateConstantBuffer, ctx);
   if (user_managed) {
     AOTI_RUNTIME_ERROR_CODE_CHECK(update_user_managed_constant_buffer_func_(
         container_handle_,
@@ -329,6 +390,11 @@ void AOTIModelContainerRunner::update_constant_buffer(
     bool use_inactive,
     bool check_full_update,
     bool user_managed) {
+  AOTIObserverContext ctx;
+  ctx.num_constants = tensor_map.size();
+  ctx.use_inactive = use_inactive;
+  ScopedObserverEvent observer_event(
+      observer(), AOTIContainerEvent::kUpdateConstantBuffer, ctx);
   TensorConstantMap const_map;
   for (auto& [k, v] : tensor_map) {
     const_map.emplace(k, &v);
@@ -352,6 +418,13 @@ void AOTIModelContainerRunner::update_constant_buffer_from_cpu(
     const TensorConstantMap& const_map,
     bool use_inactive,
     bool check_full_update) {
+  AOTIObserverContext ctx;
+  ctx.num_constants = const_map.size();
+  ctx.use_inactive = use_inactive;
+  // The tensor_map overload delegates here, so instrumenting this one covers
+  // both without double-firing.
+  ScopedObserverEvent observer_event(
+      observer(), AOTIContainerEvent::kUpdateConstantBuffer, ctx);
   TORCH_CHECK(
       update_constant_buffer_from_cpu_func_ != nullptr,
       "No update_constant_buffer_from_cpu in .so! Consider rebuild your model with the latest AOTInductor.");
@@ -448,6 +521,10 @@ void AOTIModelContainerRunner::update_inactive_constant_buffer(
 void AOTIModelContainerRunner::run_const_fold(
     bool use_inactive,
     AOTInductorStreamHandle cuda_stream_handle) {
+  AOTIObserverContext ctx;
+  ctx.use_inactive = use_inactive;
+  ScopedObserverEvent observer_event(
+      observer(), AOTIContainerEvent::kRunConstantFolding, ctx);
   AOTI_RUNTIME_ERROR_CODE_CHECK(run_const_fold_func_(
       container_handle_,
       use_inactive,
@@ -456,10 +533,14 @@ void AOTIModelContainerRunner::run_const_fold(
 }
 
 void AOTIModelContainerRunner::swap_constant_buffer() {
+  ScopedObserverEvent observer_event(
+      observer(), AOTIContainerEvent::kSwapConstantBuffer, {});
   AOTI_RUNTIME_ERROR_CODE_CHECK(swap_constant_buffer_func_(container_handle_));
 }
 
 void AOTIModelContainerRunner::free_inactive_constant_buffer() {
+  ScopedObserverEvent observer_event(
+      observer(), AOTIContainerEvent::kFreeInactiveBuffer, {});
   TORCH_CHECK(
       free_inactive_constant_buffer_func_ != nullptr,
       "No free_inactive_constant_buffer in .so! Consider rebuild your model with the latest AOTInductor.");
