@@ -333,34 +333,17 @@ class FakeProcessGroup : public Backend {
     c10d::checkSplitSizes(outputSplitSizes, outputBuffer, size_);
     // See note in _allgather_base above.
     at::AutoDispatchBelowAutograd guard;
-    if (outputSplitSizes.empty() && inputSplitSizes.empty()) {
-      outputBuffer.copy_(inputBuffer);
-    } else {
-      // Approximation: rank j's inputSplitSizes are unavailable here, so
-      // each output slot is filled by repeating inputBuffer[0:slot]. The
-      // values are deterministic but arbitrary; do not assert on them.
-      int64_t out_offset = 0;
-      auto in_size = inputBuffer.size(0);
-      for (int j = 0; j < size_; ++j) {
-        int64_t remaining = outputSplitSizes[j];
-        if (remaining > 0) {
-          TORCH_CHECK(
-              in_size > 0,
-              "alltoall_base: inputBuffer is empty but outputSplitSizes[",
-              j,
-              "] > 0");
-        }
-        int64_t dst = out_offset;
-        while (remaining > 0) {
-          auto chunk = std::min(remaining, in_size);
-          outputBuffer.narrow(0, dst, chunk)
-              .copy_(inputBuffer.narrow(0, 0, chunk));
-          dst += chunk;
-          remaining -= chunk;
-        }
-        out_offset += outputSplitSizes[j];
-      }
+    // Approximation: inputs from other ranks are unavailable here, so copy as
+    // much of the local input as fits and zero the remainder.
+    auto copy_size = std::min(inputBuffer.numel(), outputBuffer.numel());
+    auto flat_input = inputBuffer.reshape({-1});
+    auto flat_buffer =
+        at::zeros({outputBuffer.numel()}, outputBuffer.options());
+    if (copy_size > 0) {
+      flat_buffer.narrow(0, 0, copy_size)
+          .copy_(flat_input.narrow(0, 0, copy_size));
     }
+    outputBuffer.copy_(flat_buffer.view_as(outputBuffer));
     return c10::make_intrusive<FakeWork>();
   }
 
